@@ -15,13 +15,75 @@ class TrackpadLogic {
 }
 
 class ViewBox {
-  w: number = 360;
-  h: number = 780;
+  w: number = 0;
+  h: number = 0;
   remoteW: number = 1920;
   remoteH: number = 1080;
   scale: number = 1;
   panX: number = 0;
   panY: number = 0;
+  renderedW: number = 0;
+  renderedH: number = 0;
+  originX: number = 0;
+  originY: number = 0;
+
+  updateGeometry(w?: number, h?: number, remoteW?: number, remoteH?: number): void {
+    if (w !== undefined && Number.isFinite(w) && w > 0) {
+      this.w = w;
+    }
+    if (h !== undefined && Number.isFinite(h) && h > 0) {
+      this.h = h;
+    }
+    if (remoteW !== undefined && Number.isFinite(remoteW) && remoteW > 0) {
+      this.remoteW = remoteW;
+    }
+    if (remoteH !== undefined && Number.isFinite(remoteH) && remoteH > 0) {
+      this.remoteH = remoteH;
+    }
+
+    if (this.remoteW <= 0 || this.remoteH <= 0 || this.w <= 0 || this.h <= 0) {
+      this.renderedW = this.w > 0 ? this.w : 0;
+      this.renderedH = this.h > 0 ? this.h : 0;
+      this.originX = this.panX;
+      this.originY = this.panY;
+      return;
+    }
+
+    const containScale = Math.min(this.w / this.remoteW, this.h / this.remoteH);
+    this.renderedW = this.remoteW * containScale * this.scale;
+    this.renderedH = this.remoteH * containScale * this.scale;
+
+    this.constrainPan();
+
+    this.originX = (this.w - this.renderedW) / 2 + this.panX;
+    this.originY = (this.h - this.renderedH) / 2 + this.panY;
+  }
+
+  constrainPan(): void {
+    if (this.renderedW > this.w) {
+      const limitX = (this.renderedW - this.w) / 2;
+      if (this.panX > limitX) {
+        this.panX = limitX;
+      }
+      if (this.panX < -limitX) {
+        this.panX = -limitX;
+      }
+    } else {
+      this.panX = 0;
+    }
+
+    if (this.renderedH > this.h) {
+      const limitY = (this.renderedH - this.h) / 2;
+      if (this.panY > limitY) {
+        this.panY = limitY;
+      }
+      if (this.panY < -limitY) {
+        this.panY = -limitY;
+      }
+    } else {
+      this.panY = 0;
+    }
+  }
 }
 
 const TRACKPAD = new TrackpadLogic();
@@ -150,19 +212,21 @@ struct CursorLayer {
   }
 
   private screenX(): number {
-    if (VIEW.remoteW <= 0) {
-      return VIEW.w / 2;
+    if (VIEW.w <= 0 || VIEW.h <= 0 || VIEW.remoteW <= 0) {
+      return 0;
     }
-    const ox = (VIEW.w - this.imgW()) / 2 + VIEW.panX;
-    return ox + TRACKPAD.cursorX / VIEW.remoteW * this.imgW();
+    const ox = VIEW.renderedW > 0 ? VIEW.originX : (VIEW.w - this.imgW()) / 2 + VIEW.panX;
+    const w = VIEW.renderedW > 0 ? VIEW.renderedW : this.imgW();
+    return ox + TRACKPAD.cursorX / VIEW.remoteW * w;
   }
 
   private screenY(): number {
-    if (VIEW.remoteH <= 0) {
-      return VIEW.h / 2;
+    if (VIEW.w <= 0 || VIEW.h <= 0 || VIEW.remoteH <= 0) {
+      return 0;
     }
-    const oy = (VIEW.h - this.imgH()) / 2 + VIEW.panY;
-    return oy + TRACKPAD.cursorY / VIEW.remoteH * this.imgH();
+    const oy = VIEW.renderedH > 0 ? VIEW.originY : (VIEW.h - this.imgH()) / 2 + VIEW.panY;
+    const h = VIEW.renderedH > 0 ? VIEW.renderedH : this.imgH();
+    return oy + TRACKPAD.cursorY / VIEW.remoteH * h;
   }
 
   private syncPos(): void {
@@ -273,6 +337,7 @@ struct DesktopPixels {
       DESK.mapH = frame.height;
       VIEW.remoteW = frame.width;
       VIEW.remoteH = frame.height;
+      VIEW.updateGeometry(undefined, undefined, frame.width, frame.height);
       DESK.paintCount += 1;
       DEBUG.note(`pixel create ${frame.width}x${frame.height}`);
       if (old && old !== next) {
@@ -298,19 +363,20 @@ struct DesktopPixels {
 
 @Component
 struct DesktopSurface {
-  @State zoom: number = 1;
-  @State shiftX: number = 0;
-  @State shiftY: number = 0;
+  @State renderedW: number = 0;
+  @State renderedH: number = 0;
+  @State originX: number = 0;
+  @State originY: number = 0;
   @State showPixelFallback: boolean = false;
-  private zoomTimer: number = -1;
+  private syncTimer: number = -1;
   private fallbackTimer: number = -1;
   private xCtrl: VideoXController = new VideoXController();
 
   aboutToAppear() {
-    DEBUG.note('zoom layer appear');
-    this.syncZoom();
-    this.zoomTimer = setInterval(() => {
-      this.syncZoom();
+    DEBUG.note('surface layer appear');
+    this.syncGeometry();
+    this.syncTimer = setInterval(() => {
+      this.syncGeometry();
     }, 16);
     // If surface render never becomes active, fall back to PixelMap path.
     this.fallbackTimer = setInterval(() => {
@@ -319,14 +385,21 @@ struct DesktopSurface {
   }
 
   aboutToDisappear() {
-    DEBUG.note('zoom layer disappear');
-    if (this.zoomTimer !== -1) {
-      clearInterval(this.zoomTimer);
-      this.zoomTimer = -1;
+    DEBUG.note('surface layer disappear');
+    if (this.syncTimer !== -1) {
+      clearInterval(this.syncTimer);
+      this.syncTimer = -1;
     }
     if (this.fallbackTimer !== -1) {
       clearInterval(this.fallbackTimer);
       this.fallbackTimer = -1;
+    }
+  }
+
+  private updateParentViewport(w: number, h: number): void {
+    if (w > 0 && h > 0) {
+      VIEW.updateGeometry(w, h);
+      this.syncGeometry();
     }
   }
 
@@ -343,9 +416,10 @@ struct DesktopSurface {
           this.showPixelFallback = false;
           DEBUG.note('surface active, hide pixel fallback');
         }
-        if (stats.width > 0) {
-          VIEW.remoteW = stats.width;
-          VIEW.remoteH = stats.height > 0 ? stats.height : VIEW.remoteH;
+        if (stats.width > 0 && stats.height > 0) {
+          if (VIEW.remoteW !== stats.width || VIEW.remoteH !== stats.height) {
+            VIEW.updateGeometry(undefined, undefined, stats.width, stats.height);
+          }
         }
         DESK.paintCount = stats.decoded;
         return;
@@ -358,41 +432,56 @@ struct DesktopSurface {
     }
   }
 
-  private syncZoom(): void {
-    if (Math.abs(this.zoom - VIEW.scale) > 0.001 || this.shiftX !== VIEW.panX || this.shiftY !== VIEW.panY) {
-      this.zoom = VIEW.scale;
-      this.shiftX = VIEW.panX;
-      this.shiftY = VIEW.panY;
+  private syncGeometry(): void {
+    if (Math.abs(this.renderedW - VIEW.renderedW) > 0.5 ||
+        Math.abs(this.renderedH - VIEW.renderedH) > 0.5 ||
+        Math.abs(this.originX - VIEW.originX) > 0.5 ||
+        Math.abs(this.originY - VIEW.originY) > 0.5) {
+      this.renderedW = VIEW.renderedW;
+      this.renderedH = VIEW.renderedH;
+      this.originX = VIEW.originX;
+      this.originY = VIEW.originY;
     }
   }
 
   build() {
-    Stack() {
-      // RustDesk Texture analog: hardware decoder renders into this surface.
-      XComponent({
-        id: 'hd_video_surface',
-        type: XComponentType.SURFACE,
-        controller: this.xCtrl
-      })
-        .width('100%')
-        .height('100%')
-        .hitTestBehavior(HitTestMode.None)
-        .onLoad(() => {
-          const sid = this.xCtrl.getXComponentSurfaceId();
-          if (sid && sid.length > 0) {
-            DEBUG.note(`surface onLoad ${sid}`);
-            VideoSurfaceBind.bind(sid);
-          }
+    Stack({ alignContent: Alignment.TopStart }) {
+      Stack() {
+        // RustDesk Texture analog: hardware decoder renders into this surface.
+        XComponent({
+          id: 'hd_video_surface',
+          type: XComponentType.SURFACE,
+          controller: this.xCtrl
         })
+          .width('100%')
+          .height('100%')
+          .hitTestBehavior(HitTestMode.None)
+          .onLoad(() => {
+            const sid = this.xCtrl.getXComponentSurfaceId();
+            if (sid && sid.length > 0) {
+              DEBUG.note(`surface onLoad ${sid}`);
+              VideoSurfaceBind.bind(sid);
+            }
+          })
 
-      if (this.showPixelFallback) {
-        DesktopPixels()
+        if (this.showPixelFallback) {
+          DesktopPixels()
+        }
       }
+      .width(this.renderedW > 0 ? this.renderedW : '100%')
+      .height(this.renderedH > 0 ? this.renderedH : '100%')
+      .position({ x: this.originX, y: this.originY })
     }
     .width('100%')
     .height('100%')
-    .scale({ x: this.zoom, y: this.zoom })
-    .translate({ x: this.shiftX, y: this.shiftY })
+    .hitTestBehavior(HitTestMode.None)
+    .onAreaChange((_old: Area, area: Area) => {
+      const w = Number(area.width);
+      const h = Number(area.height);
+      if (w > 0 && h > 0) {
+        this.updateParentViewport(w, h);
+      }
+    })
   }
 }
 
@@ -622,8 +711,8 @@ struct Session {
   private videoTimer: number = -1;
   private logTimer: number = -1;
   private lastHint: string = '';
-  private screenWidth: number = 360;
-  private screenHeight: number = 780;
+  private screenWidth: number = 0;
+  private screenHeight: number = 0;
   private wheelW: number = 44;
   private wheelH: number = 100;
   private wheelOffsetX: number = 0;
@@ -638,8 +727,8 @@ struct Session {
   private firstFrameLogged: boolean = false;
   private firstTouchLogged: boolean = false;
   private nativeRef: HarmonyDeskNative | null = null;
-  private videoViewW: number = 360;
-  private videoViewH: number = 780;
+  private videoViewW: number = 0;
+  private videoViewH: number = 0;
   private touchDragging: boolean = false;
   private touchMoved: boolean = false;
   private rightClicked: boolean = false;
@@ -1355,6 +1444,7 @@ struct Session {
             try {
               const stats = native.getVideoStats();
               if (stats.width > 0 && stats.height > 0) {
+                VIEW.updateGeometry(undefined, undefined, stats.width, stats.height);
                 this.remoteW = stats.width;
                 this.remoteH = stats.height;
                 this.syncView();
@@ -1643,7 +1733,15 @@ struct Session {
     }
   }
 
+  private syncRemoteResolution(): void {
+    if (VIEW.remoteW > 0 && VIEW.remoteH > 0) {
+      this.remoteW = VIEW.remoteW;
+      this.remoteH = VIEW.remoteH;
+    }
+  }
+
   private containScale(): number {
+    this.syncRemoteResolution();
     if (this.remoteW <= 0 || this.remoteH <= 0 || this.videoViewW <= 0 || this.videoViewH <= 0) {
       return 1;
     }
@@ -1692,10 +1790,12 @@ struct Session {
   }
 
   private syncView(): void {
+    this.syncRemoteResolution();
     VIEW.w = this.videoViewW;
     VIEW.h = this.videoViewH;
     VIEW.remoteW = this.remoteW;
     VIEW.remoteH = this.remoteH;
+    VIEW.updateGeometry(this.videoViewW, this.videoViewH, this.remoteW, this.remoteH);
   }
 
   private constrainPan(): void {
@@ -1741,6 +1841,7 @@ struct Session {
   }
 
   private clampCursor(): void {
+    this.syncRemoteResolution();
     if (this.cursorX < 0) {
       this.cursorX = 0;
     }
@@ -1781,6 +1882,7 @@ struct Session {
     if (this.textSelectMode || TRACKPAD.ignoreGesture || TRACKPAD.freezeMove || !this.virtualMouse || !this.nativeRef || this.videoViewW <= 0) {
       return;
     }
+    this.syncRemoteResolution();
     // 触摸板灵敏度：越小越慢（约 80%）
     const speed = 0.90;
     const scale = this.remoteW / this.videoViewW * speed;
@@ -1975,6 +2077,7 @@ struct Session {
     if (this.videoViewW <= 0 || this.videoViewH <= 0) {
       return;
     }
+    this.syncRemoteResolution();
     const speed = 0.90;
     this.cursorX = Math.round(this.cursorX + dx / this.videoViewW * this.remoteW * speed);
     this.cursorY = Math.round(this.cursorY + dy / this.videoViewH * this.remoteH * speed);
