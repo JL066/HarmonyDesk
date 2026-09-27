@@ -9,3 +9,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 sha2 = { version = "0.10", default-features = false }
+# Pure-Rust Zstandard decoder. Used ONLY for inbound (Windows -> HarmonyDesk)
+# plain-text clipboard field 16 with compress=true. No C/native binding,
+# no cmake, no system lib. The compression side is intentionally not
+# included — outbound clipboard sends raw UTF-8 (compress=false) in Stage 2A.
+# Default features (hash, std) so the StreamingDecoder can verify frame
+# checksums (xxhash via twox-hash) and use std::io::Read.
+ruzstd = "0.9"

@@ -33,7 +33,11 @@ using HdSendKey = void (*)(int32_t, int32_t, int32_t);
 using HdSendChord = void (*)(int32_t, int32_t);
 using HdSetImageQuality = void (*)(int32_t);
 using HdSendText = void (*)(const char *);
+using HdSendClipboardText = int32_t (*)(const char *);
 using HdVoidFn = void (*)();
+// Stage 3A: inbound clipboard read surface. u64 seq + UTF-8 null-terminated
+// text copy (same convention as hd_copy_logs / hd_copy_error).
+using HdClipboardSeq = uint64_t (*)();
 
 std::mutex g_mu;
 bool g_inited = false;
@@ -72,7 +76,11 @@ HdSendKey g_hdSendControl = nullptr;
 HdSendChord g_hdSendChord = nullptr;
 HdSetImageQuality g_hdSetImageQuality = nullptr;
 HdSendText g_hdSendText = nullptr;
+HdSendClipboardText g_hdSendClipboardText = nullptr;
 HdVoidFn g_hdRequestKey = nullptr;
+HdClipboardSeq g_hdClipboardSeq = nullptr;
+HdIntFn g_hdClipboardAllowed = nullptr;
+HdCopy g_hdCopyClipboardText = nullptr;
 int32_t g_lastMouseX = 0;
 int32_t g_lastMouseY = 0;
 
@@ -175,7 +183,11 @@ void LoadCoreLocked()
     g_hdSendChord = reinterpret_cast<HdSendChord>(dlsym(handle, "hd_send_chord"));
     g_hdSetImageQuality = reinterpret_cast<HdSetImageQuality>(dlsym(handle, "hd_set_image_quality"));
     g_hdSendText = reinterpret_cast<HdSendText>(dlsym(handle, "hd_send_text"));
+    g_hdSendClipboardText = reinterpret_cast<HdSendClipboardText>(dlsym(handle, "hd_send_clipboard_text"));
     g_hdRequestKey = reinterpret_cast<HdVoidFn>(dlsym(handle, "hd_request_keyframe"));
+    g_hdClipboardAllowed = reinterpret_cast<HdIntFn>(dlsym(handle, "hd_clipboard_allowed"));
+    g_hdClipboardSeq = reinterpret_cast<HdClipboardSeq>(dlsym(handle, "hd_clipboard_seq"));
+    g_hdCopyClipboardText = reinterpret_cast<HdCopy>(dlsym(handle, "hd_copy_clipboard_text"));
     HdPacketApi api{};
     api.seq = g_hdPacketSeq;
     api.key = g_hdPacketKey;
@@ -506,6 +518,135 @@ napi_value SendText(napi_env env, napi_callback_info info)
     return nullptr;
 }
 
+napi_value IsClipboardAllowed(napi_env env, napi_callback_info info)
+{
+    napi_value result;
+    napi_get_boolean(env, g_hdClipboardAllowed != nullptr && g_hdClipboardAllowed() != 0, &result);
+    return result;
+}
+
+napi_value SendClipboardText(napi_env env, napi_callback_info info)
+{
+    // Forwards UTF-8 unchanged. No keyboard fallback. Returns:
+    //   0  = packet enqueued
+    //   1  = empty input (no-op)
+    //  -1  = core not ready / not loaded yet
+    const std::string text = GetUtf8Arg(env, info, 0, 1);
+    if (g_hdSendClipboardText == nullptr) {
+        AppendLog("sendClipboardText: hdcore not ready");
+        return MakeInt(env, -1);
+    }
+    if (text.empty()) {
+        return MakeInt(env, 1);
+    }
+    const int32_t rc = g_hdSendClipboardText(text.c_str());
+    return MakeInt(env, rc);
+}
+
+// Stage 3A: read-only access to the latest remote clipboard.
+// Returns the monotonic generation counter. Increases by 1 for every
+// accepted plain-text clipboard update. 0 means no clipboard received
+// in the current session.
+//
+// Returned as a JS Number via `napi_create_double` (NOT `napi_create_int32`).
+// JS Number is exactly representable through 2^53-1, which is many
+// orders of magnitude beyond any realistic session counter; a
+// `uint64_t -> int32_t` cast or a 31-bit mask would make the visible
+// generation non-monotonic for a long-running session and break the
+// "snapshot-then-poll-for-change" edge-trigger the UI uses to detect a
+// fresh remote clipboard.
+napi_value GetRemoteClipboardSeq(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    napi_value result = nullptr;
+    if (g_hdClipboardSeq == nullptr) {
+        napi_create_double(env, 0.0, &result);
+        return result;
+    }
+    const uint64_t seq = g_hdClipboardSeq();
+    napi_create_double(env, static_cast<double>(seq), &result);
+    return result;
+}
+
+// Stage 3A: returns the latest remote clipboard text (UTF-8 round-tripped).
+// Empty string when no clipboard has been received, or when the slot is
+// poisoned / exceeded the 8 MiB hard cap, or when the slot keeps
+// changing under us across the bounded retry window.
+//
+// Dynamic two-call protocol against `hd_copy_clipboard_text`:
+//   1. Call once with null buffer to learn the required UTF-8 byte length.
+//   2. Allocate that length + 1 (for the trailing NUL) and call again
+//      to copy the exact payload.
+// If the seq changes between step 1 and step 2 the slot has been
+// overwritten by another accepted clipboard and the data we just copied
+// is stale; retry the pair a small bounded number of times so the UI
+// never sees a seq/text mismatch. After the retry budget is exhausted
+// we return an empty string rather than a possibly-stale snapshot.
+napi_value GetRemoteClipboardText(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    if (g_hdCopyClipboardText == nullptr) {
+        return MakeString(env, "");
+    }
+    // 8 MiB hard cap mirrors CLIPBOARD_MAX_OUTPUT in lib.rs. Anything
+    // larger than this either signals a corrupted state or a peer
+    // exceeding the negotiated clipboard limit, and we MUST NOT hand
+    // the caller a truncated string.
+    constexpr size_t kHardCap = 8 * 1024 * 1024;
+    constexpr int kMaxRetries = 3;
+
+    uint64_t observedSeq = 0;
+    if (g_hdClipboardSeq != nullptr) {
+        observedSeq = g_hdClipboardSeq();
+    }
+
+    for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+        // Step 1: size query.
+        const int32_t required = g_hdCopyClipboardText(nullptr, 0);
+        if (required <= 0) {
+            return MakeString(env, "");
+        }
+        if (static_cast<size_t>(required) > kHardCap) {
+            AppendLog("getRemoteClipboardText: required > 8 MiB; rejecting");
+            return MakeString(env, "");
+        }
+        // Step 2: exact copy.
+        std::vector<char> buf(static_cast<size_t>(required) + 1, 0);
+        const int32_t n = g_hdCopyClipboardText(
+            buf.data(), static_cast<int32_t>(buf.size()));
+        if (n <= 0) {
+            return MakeString(env, "");
+        }
+        if (static_cast<size_t>(n) > kHardCap) {
+            AppendLog("getRemoteClipboardText: copy > 8 MiB; rejecting");
+            return MakeString(env, "");
+        }
+        // The slot can grow between step 1 and step 2. If the actual
+        // copy length does not match the size we sized for, the slot was
+        // raced: `n > required` would make `std::string(buf.data(), n)`
+        // read past the allocated `required + 1` buffer, and `n <
+        // required` would silently hand JS back a truncated payload.
+        // Either is a raced slot — retry within the bounded budget and
+        // refresh `observedSeq` so the next attempt compares against the
+        // current generation instead of the stale one.
+        if (n != required) {
+            AppendLog("getRemoteClipboardText: size mismatch; retrying");
+            if (g_hdClipboardSeq != nullptr) {
+                observedSeq = g_hdClipboardSeq();
+            }
+            continue;
+        }
+        // Verify the slot is still the snapshot we sized for; if it
+        // changed, retry.
+        if (g_hdClipboardSeq == nullptr || g_hdClipboardSeq() == observedSeq) {
+            return MakeString(env, std::string(buf.data(), static_cast<size_t>(n)));
+        }
+        observedSeq = g_hdClipboardSeq();
+    }
+    AppendLog("getRemoteClipboardText: slot kept changing; returning empty");
+    return MakeString(env, "");
+}
+
 napi_value SendControlKey(napi_env env, napi_callback_info info)
 {
     const int32_t code = GetI32Arg(env, info, 0, 2);
@@ -724,6 +865,10 @@ napi_value Register(napi_env env, napi_value exports)
         {"sendMouseClick", nullptr, SendMouseClick, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendMouseWheel", nullptr, SendMouseWheel, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendText", nullptr, SendText, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"isClipboardAllowed", nullptr, IsClipboardAllowed, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"sendClipboardText", nullptr, SendClipboardText, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getRemoteClipboardSeq", nullptr, GetRemoteClipboardSeq, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getRemoteClipboardText", nullptr, GetRemoteClipboardText, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendControlKey", nullptr, SendControlKey, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendChord", nullptr, SendChord, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setImageQuality", nullptr, SetImageQuality, nullptr, nullptr, nullptr, napi_default, nullptr},

@@ -3,8 +3,9 @@ import struct
 import zlib
 from pathlib import Path
 
-CUR = Path(r"c:\Windows\Cursors\aero_arrow_xl.cur")
-OUT = Path(r"C:\Users\Administrator\Projects\HarmonyDesk\ohos\entry\src\main\resources\base\media\win_cursor.png")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+CUR = Path(os.environ.get("HARMONY_CURSOR_SOURCE", Path(os.environ.get("WINDIR", r"C:\Windows")) / "Cursors" / "aero_arrow_xl.cur"))
+OUT = REPO_ROOT / "ohos" / "entry" / "src" / "main" / "resources" / "base" / "media" / "win_cursor.png"
 
 
 def chunk(tag: bytes, data: bytes) -> bytes:

@@ -1,7 +1,18 @@
+param(
+  [string]$Serial = $env:HDC_SERIAL,
+  [string]$HdcPath = $env:HDC_PATH,
+  [string]$OutputPath = (Join-Path $PSScriptRoot 'mouse-trace.log')
+)
 $ErrorActionPreference = "Continue"
-$hdc = "C:\Users\Administrator\Projects\ohos-sdk\toolchains\hdc.exe"
-$serial = "6XE0225B25017248"
-$out = "C:\Users\Administrator\Projects\HarmonyDesk\mouse_trace.log"
+if (-not $Serial) { throw "Set -Serial or HDC_SERIAL to the target device serial." }
+if (-not $HdcPath) {
+  $hdcCommand = Get-Command hdc -ErrorAction SilentlyContinue
+  if (-not $hdcCommand) { throw "Set -HdcPath or HDC_PATH, or add hdc to PATH." }
+  $HdcPath = $hdcCommand.Source
+}
+if (-not (Test-Path -LiteralPath $HdcPath)) { throw "HDC executable was not found at the configured HDC_PATH." }
+$hdc = $HdcPath
+$out = $OutputPath
 
 if (Test-Path $out) {
   Remove-Item $out -Force

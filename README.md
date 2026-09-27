@@ -19,12 +19,12 @@ hbbs/hbbr 与局域网 IP 直连，画面走系统硬解，输入覆盖触摸板
 | IP 直连 | 直接填写被控端 IP（默认端口 `21118`） |
 | 视频解码 | H.264 / H.265 系统硬解，XComponent / NativeWindow 出图 |
 | 触控输入 | 触摸板模式、左右键、可拖拽滚轮；支持只读（viewOnly） |
-| 屏幕键盘 | 文本/密码、中英切换，Ctrl+Alt+Del、Alt+F4、显示桌面等快捷组合 |
+| 屏幕键盘 | 独立于指针模式的系统输入法；展开时仍可移动鼠标、点击及拖选；复制/粘贴等按钮仅发送远端快捷键 |
 | 会话稳定 | 短线自动重连（有限次数）、前后台短时保活后断开 |
 | 平板 / 二合一适配 | 会话布局自适应平板与二合一形态；视窗尺寸变化时，视频面、远端分辨率、几何 / 缩放与指针 / 触摸映射保持同步 |
 | 画质档位 | UI/API 保留切换入口；核心当前为统一 profile，非完整多档平滑切换 |
 | 音频 | 未实现（核心关闭音频） |
-| 剪贴板 | 未实现（核心关闭；设置页开关仅为本地偏好占位） |
+| 剪贴板 | 会话级双向文本自动同步，支持权限控制、内容去重与返回前台补同步；会话顶部可开关；暂不支持图片、文件与清空同步 |
 | 文件传输 | 未实现（仅有设置/详情开关，无传输链路） |
 
 部分能力依赖对端 RustDesk 版本、自建中继可达性、HarmonyOS 设备权限与本机
@@ -32,7 +32,7 @@ hbbs/hbbr 与局域网 IP 直连，画面走系统硬解，输入覆盖触摸板
 
 ## 支持平台与技术栈
 
-- HarmonyOS NEXT 手机、平板与二合一设备（开发机建议 API 26 / 鸿蒙 7 基线；亦兼容 API 15+ 工具链）。
+- HarmonyOS NEXT 手机、平板与二合一设备（当前构建配置为 HarmonyOS 6.1.1 / API 24，需安装匹配 SDK）。
 - 已验证机型：MatePad Pro 2026 / HarmonyOS 6.1.0；该机型为已实测配置，不视为对全部 HarmonyOS 平板的通用兼容声明。
 - ArkTS + ArkUI 声明式 UI。
 - C++ NAPI 扩展：加载协议库、OH AVCodec 硬解与 Surface 出图。
@@ -58,7 +58,7 @@ ArkTS pages（设备列表 / 设置 / 会话触控与键盘）
                         RustDesk 被控端
 ```
 
-会话、解码与输入保持边界。可选设置项（剪贴板/文件传输等）失败或未实现时，
+会话、解码与输入保持边界。剪贴板同步由会话服务管理；文件传输等尚未实现的能力，
 不应被叙述为已建立完整桌面能力；协议核心以 `ohos/entry/ohos/hdcore/` 为准，
 遗留 `ohos/entry/ohos/rust/` 不进入主构建。
 
@@ -79,7 +79,7 @@ ArkTS pages（设备列表 / 设置 / 会话触控与键盘）
 ## 获取源码
 
 ```powershell
-git clone https://github.com/zyfdandan/HarmonyDesk.git
+git clone https://github.com/JL066/HarmonyDesk.git
 Set-Location HarmonyDesk
 ```
 
@@ -146,3 +146,17 @@ hdc install ohos\entry\build\default\outputs\default\entry-default-signed.hap
 仓库尚未放置统一的 `LICENSE` 文件；使用范围以项目授权为准。协议实现参考
 RustDesk 生态，部署与分发时请自行核对上游许可证与合规要求。请勿在公开
 issue 中提交真实服务器地址、Key、远程密码或设备日志中的敏感字段。
+
+## 文本剪贴板与输入
+
+连接成功后默认启用文本剪贴板同步。首次发送本机文本需要允许读取剪贴板；拒绝后不反复弹窗，仍可接收远端文本。会话顶部显示同步状态并可点击关闭。复制、粘贴、剪切、全选按钮只发送远端组合键，不再承担剪贴板传输。设置页旧的剪贴板偏好占位不控制本会话开关。
+
+应用返回前台时会补同步其它 App 中新复制的文本；后台保活仍有时限，不承诺系统挂起后的持续同步。图片、文件和清空剪贴板暂不支持。键盘只是独立输入层，打开与关闭不会切换指针模式。
+
+针对性测试（Node.js；通过 `HARMONY_TYPESCRIPT` 指定 TypeScript 模块，或设置 `DEVECO_DIR` 使用 SDK 内置模块）：
+
+```powershell
+node scripts/test-clipboard-sync.cjs
+node scripts/test-session-lifecycle.cjs
+cargo test --manifest-path ohos/entry/ohos/hdcore/Cargo.toml clipboard_tests -- --test-threads=1
+```

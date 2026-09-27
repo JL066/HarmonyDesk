@@ -1,6 +1,13 @@
-# Wait for Mate 80 USB authorization, then install a signed HAP if present.
+param([string]$HdcPath = $env:HDC_PATH)
+# Wait for USB authorization, then install a signed HAP if present.
 $ErrorActionPreference = "Continue"
-$hdc = "C:\Users\Administrator\Projects\ohos-sdk\toolchains\hdc.exe"
+if (-not $HdcPath) {
+  $hdcCommand = Get-Command hdc -ErrorAction SilentlyContinue
+  if (-not $hdcCommand) { throw "Set -HdcPath or HDC_PATH, or add hdc to PATH." }
+  $HdcPath = $hdcCommand.Source
+}
+if (-not (Test-Path -LiteralPath $HdcPath)) { throw "HDC executable was not found at the configured HDC_PATH." }
+$hdc = $HdcPath
 $hapCandidates = @(
   (Join-Path $PSScriptRoot "..\ohos\entry\build\default\outputs\default\entry-default-signed.hap"),
   (Join-Path $PSScriptRoot "..\ohos\entry\build\default\outputs\default\entry-default-unsigned.hap")
@@ -17,8 +24,6 @@ for ($i = 0; $i -lt 60; $i++) {
   $serial = ($targets -split "\s+") | Where-Object { $_ -and $_ -notmatch "Empty|\[|Fail" } | Select-Object -First 1
   if ($serial) {
     Write-Host "Authorized device: $serial"
-    Write-Host "UDID:"
-    & $hdc -t $serial shell "bm get --udid"
     Write-Host "Model / API:"
     & $hdc -t $serial shell "param get const.product.model; param get const.ohos.apiversion; param get const.ohos.fullname"
     $hap = $hapCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
