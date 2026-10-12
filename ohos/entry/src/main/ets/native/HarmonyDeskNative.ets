@@ -46,7 +46,32 @@ export interface HarmonyDeskNative {
   // Vertical wheel: positive = up, negative = down
   sendMouseWheel(deltaY: number): void;
   sendText(text: string): void;
+  /**
+   * Send plain text via RustDesk clipboard transport (Message field 16).
+   * Returns: 0 = enqueued, 1 = empty (no-op), -1 = core not ready.
+   * UTF-8 is forwarded byte-for-byte — no trimming / normalization.
+   */
+  sendClipboardText(text: string): number;
+  isClipboardAllowed(): boolean;
+  /**
+   * Stage 3A: monotonic generation counter for the cached remote clipboard.
+   * Increases by 1 for every accepted plain-text clipboard update.
+   * UI snapshots this before triggering a local read action and waits for
+   * a new value to detect a fresh remote clipboard.
+   */
+  getRemoteClipboardSeq(): number;
+  /**
+   * Stage 3A: return the latest remote clipboard text (UTF-8 round-tripped).
+   * Empty string when no clipboard has been received in the current session,
+   * or when the cached payload is inconsistent / exceeds the 8 MiB cap.
+   * The C++ wrapper dynamically sizes its buffer from the FFI size query,
+   * so the full accepted payload (up to 8 MiB) is returned byte-for-byte
+   * with no truncation.
+   */
+  getRemoteClipboardText(): string;
   sendControlKey(code: number, pressed: boolean): void;
+  /** Send one physical key transition with the active RustDesk ControlKey modifiers. */
+  sendHardwareKey(kind: number, code: number, pressed: boolean, modifiers: number[]): void;
   /**
    * Modifier + key chord.
    * modifier: ControlKey (Control=4, Alt=1, Shift=29, Meta=23)
@@ -234,11 +259,57 @@ class NativeModuleWrapper implements HarmonyDeskNative {
     }
   }
 
+  sendClipboardText(text: string): number {
+    try {
+      const result: number = nativeModule.sendClipboardText(text);
+      return result;
+    } catch (e) {
+      console.error('[HarmonyDeskNative] sendClipboardText error: ' + JSON.stringify(e));
+      return -1;
+    }
+  }
+
+  isClipboardAllowed(): boolean {
+    try {
+      return nativeModule.isClipboardAllowed();
+    } catch (e) {
+      return false;
+    }
+  }
+
+  getRemoteClipboardSeq(): number {
+    try {
+      const result: number = nativeModule.getRemoteClipboardSeq();
+      return result;
+    } catch (e) {
+      console.error('[HarmonyDeskNative] getRemoteClipboardSeq error: ' + JSON.stringify(e));
+      return 0;
+    }
+  }
+
+  getRemoteClipboardText(): string {
+    try {
+      const result: string = nativeModule.getRemoteClipboardText();
+      return result;
+    } catch (e) {
+      console.error('[HarmonyDeskNative] getRemoteClipboardText error: ' + JSON.stringify(e));
+      return '';
+    }
+  }
+
   sendControlKey(code: number, pressed: boolean): void {
     try {
       nativeModule.sendControlKey(code, pressed);
     } catch (e) {
       console.error('[HarmonyDeskNative] sendControlKey error: ' + JSON.stringify(e));
+    }
+  }
+
+  sendHardwareKey(kind: number, code: number, pressed: boolean, modifiers: number[]): void {
+    try {
+      nativeModule.sendHardwareKey(kind, code, pressed, modifiers);
+    } catch (e) {
+      console.error('[HarmonyDeskNative] sendHardwareKey error: ' + JSON.stringify(e));
     }
   }
 

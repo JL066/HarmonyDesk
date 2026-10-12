@@ -1,27 +1,341 @@
 import router from '@ohos.router';
 import type common from '@ohos.app.ability.common';
+import { display, window, KeyboardAvoidMode as UIKeyboardAvoidMode } from '@kit.ArkUI';
+import inputMethod from '@ohos.inputMethod';
+import { KeyCode } from '@kit.InputKit';
 import { image } from '@kit.ImageKit';
 import { isOfficialPlaceholderHost, isPlaceholderKey, isDirectIpId, RustDeskStore } from '../services/RustDeskStore';
 import type { HarmonyDeskNative } from '../native/HarmonyDeskNative';
+import { ClipboardSync } from '../services/ClipboardSync';
 import { SessionKeepAlive } from '../services/SessionKeepAlive';
+import { HardwareKeyboard } from '../services/HardwareKeyboard';
+import { HardwarePointer } from '../services/HardwarePointer';
 
 class TrackpadLogic {
   cursorX: number = 0;
   cursorY: number = 0;
-  gestureStartX: number = 0;
-  gestureStartY: number = 0;
-  ignoreGesture: boolean = false;
   freezeMove: boolean = false;
 }
 
+export enum DisplayMode {
+  FIT = 'fit',
+  FILL = 'fill',
+  ORIGINAL = '1:1'
+}
+
+export function mapScreenToRemote(
+  sx: number,
+  sy: number,
+  originX: number,
+  originY: number,
+  renderedW: number,
+  renderedH: number,
+  remoteW: number,
+  remoteH: number
+): [number, number] | null {
+  if (
+    !Number.isFinite(sx) || !Number.isFinite(sy) ||
+    !Number.isFinite(originX) || !Number.isFinite(originY) ||
+    !Number.isFinite(renderedW) || !Number.isFinite(renderedH) ||
+    !Number.isFinite(remoteW) || !Number.isFinite(remoteH) ||
+    renderedW <= 0 || renderedH <= 0 ||
+    remoteW <= 0 || remoteH <= 0
+  ) {
+    return null;
+  }
+
+  const rawRx = (sx - originX) / renderedW * remoteW;
+  const rawRy = (sy - originY) / renderedH * remoteH;
+
+  if (!Number.isFinite(rawRx) || !Number.isFinite(rawRy)) {
+    return null;
+  }
+
+  // Touches outside the rendered remote rectangle (e.g. FIT letterbox/pillarbox) return null
+  const EPSILON = 1e-4;
+  if (rawRx < -EPSILON || rawRx > remoteW + EPSILON ||
+      rawRy < -EPSILON || rawRy > remoteH + EPSILON) {
+    return null;
+  }
+
+  let rx = Math.round(rawRx);
+  let ry = Math.round(rawRy);
+
+  const maxRx = Math.max(0, Math.floor(remoteW) - 1);
+  const maxRy = Math.max(0, Math.floor(remoteH) - 1);
+
+  if (rx < 0) {
+    rx = 0;
+  } else if (rx > maxRx) {
+    rx = maxRx;
+  }
+
+  if (ry < 0) {
+    ry = 0;
+  } else if (ry > maxRy) {
+    ry = maxRy;
+  }
+
+  return [rx, ry];
+}
+
+export function runGeometrySanityChecks(): boolean {
+  // Check 1: FIT 1920x1080 inside representative tablet viewport 1280x800
+  const vbFit = new ViewBox();
+  vbFit.mode = DisplayMode.FIT;
+  vbFit.updateGeometry(1280, 800, 1920, 1080);
+  const center = vbFit.screenToRemote(640, 400);
+  const cornerTL = vbFit.screenToRemote(vbFit.originX, vbFit.originY);
+  const cornerBR = vbFit.screenToRemote(vbFit.originX + vbFit.renderedW, vbFit.originY + vbFit.renderedH);
+  const lbTop = vbFit.screenToRemote(640, 10);
+  const lbBtm = vbFit.screenToRemote(640, 790);
+
+  // Check 2: FILL in 1280x800
+  const vbFill = new ViewBox();
+  vbFill.mode = DisplayMode.FILL;
+  vbFill.updateGeometry(1280, 800, 1920, 1080);
+  const fillCenter = vbFill.screenToRemote(640, 400);
+  const fillLeft = vbFill.screenToRemote(0, 400);
+
+  // Check 3: 1:1 with pan
+  const vb11 = new ViewBox();
+  vb11.mode = DisplayMode.ORIGINAL;
+  vb11.panX = 100;
+  vb11.panY = -50;
+  vb11.updateGeometry(1280, 800, 1920, 1080);
+  const p11 = vb11.screenToRemote(640, 400);
+
+  // Check 4: Relative motion scales
+  const sX = (1920 / 1280) * 0.90;
+  const sY = (1080 / 800) * 0.90;
+
+  const ok = (center !== null && center[0] === 960 && center[1] === 540)
+    && (cornerTL !== null && cornerTL[0] === 0 && cornerTL[1] === 0)
+    && (cornerBR !== null && cornerBR[0] === 1919 && cornerBR[1] === 1079)
+    && (lbTop === null && lbBtm === null)
+    && (fillCenter !== null && fillCenter[0] === 960 && fillCenter[1] === 540)
+    && (fillLeft !== null && fillLeft[0] === 96 && fillLeft[1] === 540)
+    && (p11 !== null && p11[0] === 860 && p11[1] === 590)
+    && (Math.abs(sX - 1.35) < 0.001 && Math.abs(sY - 1.215) < 0.001);
+
+  console.info(`[HdHud] [GeometrySanity] pass=${ok} center=${center} tl=${cornerTL} br=${cornerBR} lbTop=${lbTop} lbBtm=${lbBtm} fill=${fillCenter} 1:1=${p11} sX=${sX.toFixed(3)} sY=${sY.toFixed(3)}`);
+  return ok;
+}
+
+export function mapRemoteToScreen(
+  rx: number,
+  ry: number,
+  originX: number,
+  originY: number,
+  renderedW: number,
+  renderedH: number,
+  remoteW: number,
+  remoteH: number,
+  viewportW: number = 0,
+  viewportH: number = 0
+): [number, number] {
+  if (
+    !Number.isFinite(rx) || !Number.isFinite(ry) ||
+    !Number.isFinite(originX) || !Number.isFinite(originY) ||
+    !Number.isFinite(renderedW) || !Number.isFinite(renderedH) ||
+    !Number.isFinite(remoteW) || !Number.isFinite(remoteH) ||
+    remoteW <= 0 || remoteH <= 0
+  ) {
+    return [viewportW > 0 ? viewportW / 2 : 0, viewportH > 0 ? viewportH / 2 : 0];
+  }
+
+  const sx = originX + (rx / remoteW) * renderedW;
+  const sy = originY + (ry / remoteH) * renderedH;
+
+  if (!Number.isFinite(sx) || !Number.isFinite(sy)) {
+    return [viewportW > 0 ? viewportW / 2 : 0, viewportH > 0 ? viewportH / 2 : 0];
+  }
+
+  return [sx, sy];
+}
+
 class ViewBox {
-  w: number = 360;
-  h: number = 780;
+  w: number = 0;
+  h: number = 0;
   remoteW: number = 1920;
   remoteH: number = 1080;
-  scale: number = 1;
+  mode: DisplayMode = DisplayMode.FIT;
+  userZoom: number = 1;
   panX: number = 0;
   panY: number = 0;
+
+  // Authoritative geometry calculation results
+  baseScale: number = 1;
+  scale: number = 1; // effectiveScale = baseScale * userZoom
+  renderedW: number = 0;
+  renderedH: number = 0;
+  originX: number = 0;
+  originY: number = 0;
+
+  updateGeometry(w?: number, h?: number, remoteW?: number, remoteH?: number): void {
+    if (w !== undefined && Number.isFinite(w) && w > 0) {
+      this.w = w;
+    }
+    if (h !== undefined && Number.isFinite(h) && h > 0) {
+      this.h = h;
+    }
+    if (remoteW !== undefined && Number.isFinite(remoteW) && remoteW > 0) {
+      this.remoteW = remoteW;
+    }
+    if (remoteH !== undefined && Number.isFinite(remoteH) && remoteH > 0) {
+      this.remoteH = remoteH;
+    }
+
+    if (this.remoteW <= 0 || this.remoteH <= 0 || this.w <= 0 || this.h <= 0) {
+      this.baseScale = 1;
+      this.scale = this.userZoom;
+      this.renderedW = this.w > 0 ? this.w : 0;
+      this.renderedH = this.h > 0 ? this.h : 0;
+      this.originX = this.panX;
+      this.originY = this.panY;
+      return;
+    }
+
+    // 1. Calculate baseScale for selected aspect-preserving mode
+    if (this.mode === DisplayMode.FIT) {
+      this.baseScale = Math.min(this.w / this.remoteW, this.h / this.remoteH);
+    } else if (this.mode === DisplayMode.FILL) {
+      this.baseScale = Math.max(this.w / this.remoteW, this.h / this.remoteH);
+    } else if (this.mode === DisplayMode.ORIGINAL) {
+      this.baseScale = 1.0;
+    } else {
+      this.baseScale = Math.min(this.w / this.remoteW, this.h / this.remoteH);
+    }
+
+    // 2. Effective scale with user zoom
+    this.scale = this.baseScale * this.userZoom;
+
+    // 3. Rendered dimensions (strictly aspect-preserving)
+    this.renderedW = this.remoteW * this.scale;
+    this.renderedH = this.remoteH * this.scale;
+
+    // 4. Constrain pan limits
+    this.constrainPan();
+
+    // 5. Origin coordinates
+    this.originX = (this.w - this.renderedW) / 2 + this.panX;
+    this.originY = (this.h - this.renderedH) / 2 + this.panY;
+  }
+
+  constrainPan(): void {
+    if (this.renderedW > this.w) {
+      const limitX = (this.renderedW - this.w) / 2;
+      if (this.panX > limitX) {
+        this.panX = limitX;
+      }
+      if (this.panX < -limitX) {
+        this.panX = -limitX;
+      }
+    } else {
+      this.panX = 0;
+    }
+
+    if (this.renderedH > this.h) {
+      const limitY = (this.renderedH - this.h) / 2;
+      if (this.panY > limitY) {
+        this.panY = limitY;
+      }
+      if (this.panY < -limitY) {
+        this.panY = -limitY;
+      }
+    } else {
+      this.panY = 0;
+    }
+  }
+
+  setMode(mode: DisplayMode): void {
+    this.mode = mode;
+    this.userZoom = 1;
+    this.panX = 0;
+    this.panY = 0;
+    this.updateGeometry();
+  }
+
+  setUserZoom(zoom: number): void {
+    if (!Number.isFinite(zoom) || zoom < 1) {
+      zoom = 1;
+    }
+    if (zoom > 5) {
+      zoom = 5;
+    }
+    this.userZoom = zoom;
+    if (this.userZoom <= 1.01) {
+      this.userZoom = 1;
+      if (this.mode === DisplayMode.FIT) {
+        this.panX = 0;
+        this.panY = 0;
+      }
+    }
+    this.updateGeometry();
+  }
+
+  reset(): void {
+    this.userZoom = 1;
+    this.panX = 0;
+    this.panY = 0;
+    this.updateGeometry();
+  }
+
+  screenToRemote(sx: number, sy: number): [number, number] | null {
+    return mapScreenToRemote(
+      sx,
+      sy,
+      this.originX,
+      this.originY,
+      this.renderedW,
+      this.renderedH,
+      this.remoteW,
+      this.remoteH
+    );
+  }
+
+  remoteToScreen(rx: number, ry: number): [number, number] {
+    return mapRemoteToScreen(
+      rx,
+      ry,
+      this.originX,
+      this.originY,
+      this.renderedW,
+      this.renderedH,
+      this.remoteW,
+      this.remoteH,
+      this.w,
+      this.h
+    );
+  }
+
+  clampRemoteX(rx: number): number {
+    if (!Number.isFinite(rx) || this.remoteW <= 0) {
+      return 0;
+    }
+    const max = Math.max(0, Math.floor(this.remoteW) - 1);
+    if (rx < 0) {
+      return 0;
+    }
+    if (rx > max) {
+      return max;
+    }
+    return Math.round(rx);
+  }
+
+  clampRemoteY(ry: number): number {
+    if (!Number.isFinite(ry) || this.remoteH <= 0) {
+      return 0;
+    }
+    const max = Math.max(0, Math.floor(this.remoteH) - 1);
+    if (ry < 0) {
+      return 0;
+    }
+    if (ry > max) {
+      return max;
+    }
+    return Math.round(ry);
+  }
 }
 
 const TRACKPAD = new TrackpadLogic();
@@ -134,41 +448,11 @@ struct CursorLayer {
     }
   }
 
-  private contain(): number {
-    if (VIEW.remoteW <= 0 || VIEW.remoteH <= 0 || VIEW.w <= 0 || VIEW.h <= 0) {
-      return 1;
-    }
-    return Math.min(VIEW.w / VIEW.remoteW, VIEW.h / VIEW.remoteH);
-  }
-
-  private imgW(): number {
-    return VIEW.remoteW * this.contain() * VIEW.scale;
-  }
-
-  private imgH(): number {
-    return VIEW.remoteH * this.contain() * VIEW.scale;
-  }
-
-  private screenX(): number {
-    if (VIEW.remoteW <= 0) {
-      return VIEW.w / 2;
-    }
-    const ox = (VIEW.w - this.imgW()) / 2 + VIEW.panX;
-    return ox + TRACKPAD.cursorX / VIEW.remoteW * this.imgW();
-  }
-
-  private screenY(): number {
-    if (VIEW.remoteH <= 0) {
-      return VIEW.h / 2;
-    }
-    const oy = (VIEW.h - this.imgH()) / 2 + VIEW.panY;
-    return oy + TRACKPAD.cursorY / VIEW.remoteH * this.imgH();
-  }
-
   private syncPos(): void {
-    const nx = this.screenX();
-    const ny = this.screenY();
-    if (nx !== this.drawX || ny !== this.drawY) {
+    const screen = VIEW.remoteToScreen(TRACKPAD.cursorX, TRACKPAD.cursorY);
+    const nx = screen[0];
+    const ny = screen[1];
+    if (Math.abs(nx - this.drawX) > 0.5 || Math.abs(ny - this.drawY) > 0.5) {
       this.drawX = nx;
       this.drawY = ny;
     }
@@ -271,8 +555,9 @@ struct DesktopPixels {
       DESK.pixelMap = next;
       DESK.mapW = frame.width;
       DESK.mapH = frame.height;
-      VIEW.remoteW = frame.width;
-      VIEW.remoteH = frame.height;
+      if (VIEW.remoteW !== frame.width || VIEW.remoteH !== frame.height) {
+        VIEW.updateGeometry(undefined, undefined, frame.width, frame.height);
+      }
       DESK.paintCount += 1;
       DEBUG.note(`pixel create ${frame.width}x${frame.height}`);
       if (old && old !== next) {
@@ -287,7 +572,7 @@ struct DesktopPixels {
   build() {
     if (this.pixelMap) {
       Image(this.pixelMap)
-        .objectFit(ImageFit.Contain)
+        .objectFit(ImageFit.Fill)
         .width('100%')
         .height('100%')
         .interpolation(ImageInterpolation.Low)
@@ -298,19 +583,21 @@ struct DesktopPixels {
 
 @Component
 struct DesktopSurface {
-  @State zoom: number = 1;
-  @State shiftX: number = 0;
-  @State shiftY: number = 0;
+  @State renderedW: number = 0;
+  @State renderedH: number = 0;
+  @State originX: number = 0;
+  @State originY: number = 0;
   @State showPixelFallback: boolean = false;
-  private zoomTimer: number = -1;
+  private syncTimer: number = -1;
   private fallbackTimer: number = -1;
   private xCtrl: VideoXController = new VideoXController();
 
   aboutToAppear() {
-    DEBUG.note('zoom layer appear');
-    this.syncZoom();
-    this.zoomTimer = setInterval(() => {
-      this.syncZoom();
+    DEBUG.note('surface layer appear');
+    this.initViewportFromDisplay();
+    this.syncGeometry();
+    this.syncTimer = setInterval(() => {
+      this.syncGeometry();
     }, 16);
     // If surface render never becomes active, fall back to PixelMap path.
     this.fallbackTimer = setInterval(() => {
@@ -319,14 +606,35 @@ struct DesktopSurface {
   }
 
   aboutToDisappear() {
-    DEBUG.note('zoom layer disappear');
-    if (this.zoomTimer !== -1) {
-      clearInterval(this.zoomTimer);
-      this.zoomTimer = -1;
+    DEBUG.note('surface layer disappear');
+    if (this.syncTimer !== -1) {
+      clearInterval(this.syncTimer);
+      this.syncTimer = -1;
     }
     if (this.fallbackTimer !== -1) {
       clearInterval(this.fallbackTimer);
       this.fallbackTimer = -1;
+    }
+  }
+
+  private initViewportFromDisplay(): void {
+    try {
+      const disp = display.getDefaultDisplaySync();
+      if (disp && disp.width > 0 && disp.height > 0 && disp.densityPixels > 0) {
+        const dw = disp.width / disp.densityPixels;
+        const dh = disp.height / disp.densityPixels;
+        if (dw > 0 && dh > 0 && (VIEW.w <= 0 || VIEW.h <= 0)) {
+          VIEW.updateGeometry(dw, dh);
+        }
+      }
+    } catch (_e) {
+    }
+  }
+
+  private updateParentViewport(w: number, h: number): void {
+    if (w > 0 && h > 0) {
+      VIEW.updateGeometry(w, h);
+      this.syncGeometry();
     }
   }
 
@@ -343,9 +651,10 @@ struct DesktopSurface {
           this.showPixelFallback = false;
           DEBUG.note('surface active, hide pixel fallback');
         }
-        if (stats.width > 0) {
-          VIEW.remoteW = stats.width;
-          VIEW.remoteH = stats.height > 0 ? stats.height : VIEW.remoteH;
+        if (stats.width > 0 && stats.height > 0) {
+          if (VIEW.remoteW !== stats.width || VIEW.remoteH !== stats.height) {
+            VIEW.updateGeometry(undefined, undefined, stats.width, stats.height);
+          }
         }
         DESK.paintCount = stats.decoded;
         return;
@@ -358,179 +667,469 @@ struct DesktopSurface {
     }
   }
 
-  private syncZoom(): void {
-    if (Math.abs(this.zoom - VIEW.scale) > 0.001 || this.shiftX !== VIEW.panX || this.shiftY !== VIEW.panY) {
-      this.zoom = VIEW.scale;
-      this.shiftX = VIEW.panX;
-      this.shiftY = VIEW.panY;
+  private syncGeometry(): void {
+    if (Math.abs(this.renderedW - VIEW.renderedW) > 0.5 ||
+        Math.abs(this.renderedH - VIEW.renderedH) > 0.5 ||
+        Math.abs(this.originX - VIEW.originX) > 0.5 ||
+        Math.abs(this.originY - VIEW.originY) > 0.5) {
+      this.renderedW = VIEW.renderedW;
+      this.renderedH = VIEW.renderedH;
+      this.originX = VIEW.originX;
+      this.originY = VIEW.originY;
     }
   }
 
   build() {
-    Stack() {
-      // RustDesk Texture analog: hardware decoder renders into this surface.
-      XComponent({
-        id: 'hd_video_surface',
-        type: XComponentType.SURFACE,
-        controller: this.xCtrl
-      })
-        .width('100%')
-        .height('100%')
-        .hitTestBehavior(HitTestMode.None)
-        .onLoad(() => {
-          const sid = this.xCtrl.getXComponentSurfaceId();
-          if (sid && sid.length > 0) {
-            DEBUG.note(`surface onLoad ${sid}`);
-            VideoSurfaceBind.bind(sid);
-          }
+    Stack({ alignContent: Alignment.TopStart }) {
+      Stack() {
+        // RustDesk Texture analog: hardware decoder renders into this surface.
+        XComponent({
+          id: 'hd_video_surface',
+          type: XComponentType.SURFACE,
+          controller: this.xCtrl
         })
+          .width('100%')
+          .height('100%')
+          .hitTestBehavior(HitTestMode.None)
+          .onLoad(() => {
+            const sid = this.xCtrl.getXComponentSurfaceId();
+            if (sid && sid.length > 0) {
+              DEBUG.note(`surface onLoad ${sid}`);
+              VideoSurfaceBind.bind(sid);
+            }
+          })
 
-      if (this.showPixelFallback) {
-        DesktopPixels()
+        if (this.showPixelFallback) {
+          DesktopPixels()
+        }
       }
+      .width(this.renderedW > 0 ? this.renderedW : '100%')
+      .height(this.renderedH > 0 ? this.renderedH : '100%')
+      .position({ x: this.originX, y: this.originY })
     }
     .width('100%')
     .height('100%')
-    .scale({ x: this.zoom, y: this.zoom })
-    .translate({ x: this.shiftX, y: this.shiftY })
+    .hitTestBehavior(HitTestMode.None)
+    .onAreaChange((_old: Area, area: Area) => {
+      const w = Number(area.width);
+      const h = Number(area.height);
+      if (w > 0 && h > 0) {
+        this.updateParentViewport(w, h);
+      }
+    })
+  }
+}
+
+// Serialize the shared IME controller across quick open/close/open transitions.
+let remoteImeQueue: Promise<void> = Promise.resolve();
+
+@Component
+struct TypeBar {
+  @Prop @Watch('updateSoftKeyboard') showSoftKeyboard: boolean = false;
+  onReady: (ready: boolean) => void = (_ready: boolean) => {};
+  onSend: (text: string) => void = (_text: string) => {};
+  onControl: (code: number) => void = (_code: number) => {};
+  onClose: () => void = () => {};
+  private controller: inputMethod.InputMethodController = inputMethod.getController();
+  private active: boolean = false;
+  private attached: boolean = false;
+  private keyboardShown: boolean = false;
+  private keyboardStatus: (status: inputMethod.KeyboardStatus) => void = (status: inputMethod.KeyboardStatus) => {
+    if (status === inputMethod.KeyboardStatus.SHOW) { this.keyboardShown = true; }
+    if (status === inputMethod.KeyboardStatus.HIDE && this.active && this.keyboardShown) {
+      this.onClose();
+    }
+  };
+  private insert: (text: string) => void = (text: string) => {
+    if (this.active) {
+      this.onSend(text);
+      console.info(`[SessionUI] IME commit length=${text.length}`);
+    }
+  };
+  private deleteLeft: (length: number) => void = (length: number) => {
+    if (this.active) {
+      for (let i = 0; i < length; i++) { this.onControl(2); }
+      console.info(`[SessionUI] IME backspace count=${length}`);
+    }
+  };
+  private deleteRight: (length: number) => void = (length: number) => {
+    if (this.active) {
+      for (let i = 0; i < length; i++) { this.onControl(5); }
+      console.info(`[SessionUI] IME delete count=${length}`);
+    }
+  };
+  private enter: (key: inputMethod.FunctionKey) => void = (_key: inputMethod.FunctionKey) => {
+    if (this.active) { this.onControl(27); }
+  };
+  private leftText: (length: number) => string = (_length: number) => '';
+  private rightText: (length: number) => string = (_length: number) => '';
+  private cursorIndex: () => number = () => 0;
+  private moveCursor: (direction: inputMethod.Direction) => void = (direction: inputMethod.Direction) => {
+    if (!this.active) { return; }
+    // RustDesk ControlKey: Up=32, Down=6, Left=22, Right=28.
+    const codes: number[] = [0, 32, 6, 22, 28];
+    const code = codes[direction];
+    if (code > 0) { this.onControl(code); }
+  };
+
+  private updateSoftKeyboard(): void {
+    remoteImeQueue = remoteImeQueue.catch(() => {}).then(async () => {
+      if (!this.active || !this.attached) { return; }
+      if (this.showSoftKeyboard) { await this.controller.showTextInput(); }
+      else { await this.controller.hideTextInput(); }
+    }).catch(() => console.error('[SessionUI] IME visibility update failed'));
+  }
+
+  aboutToAppear() {
+    this.active = true;
+    remoteImeQueue = remoteImeQueue.catch(() => {}).then(async () => {
+      if (!this.active) { return; }
+      try {
+        const win = await window.getLastWindow(getContext(this));
+        await this.controller.attach(false, {
+          inputAttribute: { textInputType: inputMethod.TextInputType.TEXT,
+            enterKeyType: inputMethod.EnterKeyType.NEWLINE },
+          windowId: win.getWindowProperties().id
+        });
+        this.attached = true;
+        if (!this.active) { return; }
+      this.controller.on('sendKeyboardStatus', this.keyboardStatus);
+      this.controller.on('insertText', this.insert);
+      this.controller.on('deleteLeft', this.deleteLeft);
+      this.controller.on('deleteRight', this.deleteRight);
+      this.controller.on('sendFunctionKey', this.enter);
+      this.controller.on('getLeftTextOfCursor', this.leftText);
+      this.controller.on('getRightTextOfCursor', this.rightText);
+      this.controller.on('getTextIndexAtCursor', this.cursorIndex);
+      this.controller.on('moveCursor', this.moveCursor);
+        if (this.showSoftKeyboard) { await this.controller.showTextInput(); }
+        if (this.active) { this.onReady(true); }
+        console.info('[SessionUI] direct IME attached');
+      } catch (_error) {
+        console.error('[SessionUI] direct IME attach failed');
+        if (this.active) { this.onClose(); }
+      }
+    });
+  }
+
+  aboutToDisappear() {
+    this.active = false;
+    this.onReady(false);
+    remoteImeQueue = remoteImeQueue.catch(() => {}).then(async () => {
+      this.controller.off('sendKeyboardStatus', this.keyboardStatus);
+      this.controller.off('insertText', this.insert);
+      this.controller.off('deleteLeft', this.deleteLeft);
+      this.controller.off('deleteRight', this.deleteRight);
+      this.controller.off('sendFunctionKey', this.enter);
+      this.controller.off('getLeftTextOfCursor', this.leftText);
+      this.controller.off('getRightTextOfCursor', this.rightText);
+      this.controller.off('getTextIndexAtCursor', this.cursorIndex);
+      this.controller.off('moveCursor', this.moveCursor);
+      if (this.attached) {
+        try { await this.controller.detach(); } catch (_error) {}
+        this.attached = false;
+      }
+    });
+  }
+
+  build() {
+    Row({ space: 8 }) {
+      Text('直接输入远端').fontSize(12).fontColor(Color.White).layoutWeight(1)
+      Button('Tab').focusOnTouch(false).onClick(() => this.onControl(31))
+      Button('退格').focusOnTouch(false).onClick(() => this.onControl(2))
+      Button('回车').focusOnTouch(false).onClick(() => this.onControl(27))
+      Button('收键盘').focusOnTouch(false).onClick(() => this.onClose())
+    }
+    .padding(10).width('100%').backgroundColor('rgba(22,22,26,0.94)')
+    .height(this.showSoftKeyboard ? 48 : 0)
+    .visibility(this.showSoftKeyboard ? Visibility.Visible : Visibility.None)
+    .hitTestBehavior(HitTestMode.Default)
+  }
+}
+
+// Angles wrap at +/- PI; accumulated fractional motion avoids jitter and lost steps.
+class CircularScroll {
+  private angle: number = 0;
+  private carry: number = 0;
+  private anchored: boolean = false;
+  reset(): void { this.anchored = false; this.carry = 0; }
+  move(x: number, y: number): number {
+    if (x * x + y * y < 100) { this.anchored = false; return 0; }
+    const angle = Math.atan2(y, x);
+    if (!this.anchored) { this.angle = angle; this.anchored = true; return 0; }
+    let delta = angle - this.angle;
+    this.angle = angle;
+    if (delta > Math.PI) { delta -= 2 * Math.PI; }
+    if (delta < -Math.PI) { delta += 2 * Math.PI; }
+    this.carry += delta / (Math.PI / 12);
+    const steps = Math.trunc(this.carry);
+    this.carry -= steps;
+    return -steps;
   }
 }
 
 @Component
-struct TypeBar {
-  onSend: (text: string) => void = (_text: string) => {};
-  onControl: (code: number) => void = (_code: number) => {};
-  onImeToggle: () => void = () => {};
-  onCad: () => void = () => {};
-  onAltF4: () => void = () => {};
-  onShowDesktop: () => void = () => {};
-  @State draft: string = '';
-  @State passwordMode: boolean = false;
+struct FloatingMouse {
+  onMove: (dx: number, dy: number) => void = (_dx: number, _dy: number) => {};
+  onButton: (button: number, down: boolean) => void = (_button: number, _down: boolean) => {};
+  onScroll: (delta: number) => void = (_delta: number) => {};
+  onWheelAxis: (axis: number) => void = (_axis: number) => {};
+  onRelease: () => void = () => {};
+  @Prop @Watch('constrain') viewportW: number = 0;
+  @Prop @Watch('constrain') viewportH: number = 0;
+  @Prop @Watch('constrain') keyboardInset: number = 0;
+  @State x: number = 100;
+  @State y: number = 200;
+  @State minimized: boolean = false;
+  @State held: number = 0;
+  private lastX: number = 0;
+  private lastY: number = 0;
+  private moved: number = 0;
+  private lastTap: number = 0;
+  private centerId: number = -1;
+  private leftDragId: number = -1;
+  private leftLastX: number = 0;
+  private leftLastY: number = 0;
+  @State ringHeld: boolean = false;
+  @State ringAngle: number = Math.PI / 2;
+  private ringId: number = -1;
+  private ringCenterX: number = 0;
+  private ringCenterY: number = 0;
+  private followTimer: number = -1;
+  private scroll: CircularScroll = new CircularScroll();
 
-  private submitDraft(): void {
-    if (this.draft.length === 0) {
-      // 空框：真回车
-      this.onControl(27);
+  aboutToAppear() {
+    this.constrain();
+    this.followTimer = setInterval(() => this.constrain(), 16);
+  }
+  aboutToDisappear() {
+    if (this.followTimer !== -1) { clearInterval(this.followTimer); this.followTimer = -1; }
+    this.onRelease();
+  }
+  private constrain(): void {
+    if (this.ringId !== -1) { return; }
+    // Keep the cursor exposed above and to the left of the left button,
+    // matching the reference layout. Near the right edge, put the controls
+    // on the other side of the cursor instead of clamping them over its tip.
+    const target = VIEW.remoteToScreen(TRACKPAD.cursorX, TRACKPAD.cursorY);
+    this.x = target[0] - (this.minimized ? 24 : 8);
+    this.y = target[1] - (this.minimized ? -20 : 112);
+    if (!this.minimized && this.x + 176 > this.viewportW - 8) {
+      this.x = target[0] - 168;
+    }
+    this.x = Math.max(8, Math.min(this.x, this.viewportW - (this.minimized ? 48 : 176) - 8));
+    this.y = Math.max(8, Math.min(this.y, this.viewportH - this.keyboardInset - (this.minimized ? 48 : 248) - 8));
+  }
+  private ringTouch(event: TouchEvent): void {
+    event.stopPropagation();
+    if (event.type === TouchType.Cancel) {
+      this.ringId = -1; this.ringHeld = false; this.scroll.reset();
+      console.info('[SessionUI] ring cancel');
       return;
     }
-    // 有字：只发文字，不带真回车
-    const text = this.draft;
-    this.draft = '';
-    this.onSend(text);
+    for (let i = 0; i < event.changedTouches.length; i++) {
+      const touch = event.changedTouches[i];
+      if (event.type === TouchType.Down && this.ringId === -1) {
+        this.ringId = touch.id;
+        this.ringHeld = true;
+        // Lock the window-space center for this finger, including when the
+        // gesture starts on the lower solid knob instead of the dotted ring.
+        this.ringCenterX = touch.windowX - touch.x + 46;
+        this.ringCenterY = touch.windowY - touch.y + 46;
+        this.scroll.reset();
+        console.info('[SessionUI] ring down');
+      }
+      if (touch.id !== this.ringId) { continue; }
+      if (event.type === TouchType.Down || event.type === TouchType.Move) {
+        const dx = touch.windowX - this.ringCenterX;
+        const dy = touch.windowY - this.ringCenterY;
+        this.ringAngle = Math.atan2(dy, dx);
+        const delta = this.scroll.move(dx, dy);
+        if (delta !== 0) {
+          this.onScroll(delta);
+          console.info(`[SessionUI] ring wheel=${delta}`);
+        }
+      } else if (event.type === TouchType.Up) {
+        this.ringId = -1; this.ringHeld = false; this.scroll.reset();
+        console.info('[SessionUI] ring up');
+      }
+    }
+  }
+
+  private buttonTouch(event: TouchEvent, button: number): void {
+    event.stopPropagation();
+    if (button === 0) {
+      // Left button also drags the remote pointer while the same finger stays down,
+      // enabling drag-select on the remote desktop.
+      this.leftButtonTouch(event);
+      return;
+    }
+    const mask = 1 << button;
+    if (event.type === TouchType.Down && (this.held & mask) === 0) {
+      this.held |= mask;
+      this.onButton(button, true);
+    } else if ((event.type === TouchType.Up || event.type === TouchType.Cancel) && (this.held & mask) !== 0) {
+      this.held &= ~mask;
+      this.onButton(button, false);
+    }
+  }
+
+  private leftButtonTouch(event: TouchEvent): void {
+    const mask = 1;
+    if (event.type === TouchType.Down) {
+      if ((this.held & mask) !== 0) {
+        // Already pressed by another finger; ignore extra Down to avoid duplicate down events.
+        return;
+      }
+      const touch = event.changedTouches[0];
+      if (!touch) {
+        return;
+      }
+      this.leftDragId = touch.id;
+      this.leftLastX = touch.windowX;
+      this.leftLastY = touch.windowY;
+      this.held |= mask;
+      this.onButton(0, true);
+      return;
+    }
+    if (event.type === TouchType.Move) {
+      if (this.leftDragId === -1) {
+        return;
+      }
+      for (let i = 0; i < event.changedTouches.length; i++) {
+        const touch = event.changedTouches[i];
+        if (touch.id !== this.leftDragId) {
+          continue;
+        }
+        const dx = touch.windowX - this.leftLastX;
+        const dy = touch.windowY - this.leftLastY;
+        this.leftLastX = touch.windowX;
+        this.leftLastY = touch.windowY;
+        this.onMove(dx, dy);
+        return;
+      }
+      return;
+    }
+    if (event.type === TouchType.Cancel) {
+      if ((this.held & mask) !== 0) {
+        this.held &= ~mask;
+        this.onButton(0, false);
+      }
+      this.leftDragId = -1;
+      return;
+    }
+    if (event.type === TouchType.Up) {
+      if (this.leftDragId !== -1) {
+        const matched = event.changedTouches.find((t: TouchObject) => t.id === this.leftDragId) !== undefined;
+        if (!matched) {
+          return;
+        }
+      }
+      if ((this.held & mask) !== 0) {
+        this.held &= ~mask;
+        this.onButton(0, false);
+      }
+      this.leftDragId = -1;
+      return;
+    }
+  }
+  private centerTouch(event: TouchEvent): void {
+    event.stopPropagation();
+    if (event.type === TouchType.Cancel) { this.centerId = -1; this.lastTap = 0; return; }
+    const touch = event.changedTouches[0];
+    if (!touch) { return; }
+    if (event.type === TouchType.Down && this.centerId === -1) {
+      this.centerId = touch.id; this.lastX = touch.windowX; this.lastY = touch.windowY; this.moved = 0;
+    } else if (touch.id === this.centerId && event.type === TouchType.Move) {
+      const dx = touch.windowX - this.lastX;
+      const dy = touch.windowY - this.lastY;
+      this.lastX = touch.windowX; this.lastY = touch.windowY;
+      this.moved += Math.abs(dx) + Math.abs(dy);
+      this.onMove(dx, dy);
+      this.constrain();
+    } else if (touch.id === this.centerId && event.type === TouchType.Up) {
+      this.centerId = -1;
+      if (this.moved < 8) {
+        const now = Date.now();
+        if (now - this.lastTap < 350) {
+          this.onRelease(); this.held = 0; this.minimized = true; this.constrain();
+          console.info('[SessionUI] floating mouse minimized');
+          this.lastTap = 0;
+        } else { this.lastTap = now; }
+      } else { this.lastTap = 0; }
+    }
+  }
+
+  private mousePath(commands: string): string {
+    // Path command coordinates are physical pixels; the surrounding layout uses vp.
+    return commands.replace(/-?\d+(?:\.\d+)?/g, (value: string) => String(vp2px(Number(value))));
   }
 
   build() {
-    Column({ space: 8 }) {
-      Row({ space: 6 }) {
-        Button('Ctrl+Alt+Del')
-          .layoutWeight(1)
-          .height(40)
-          .fontSize(13)
-          .fontColor(Color.White)
-          .backgroundColor('rgba(255, 255, 255, 0.18)')
-          .onClick(() => {
-            this.onCad();
-          })
-        Button('Alt+F4')
-          .layoutWeight(1)
-          .height(40)
-          .fontSize(13)
-          .fontColor(Color.White)
-          .backgroundColor('rgba(255, 255, 255, 0.18)')
-          .onClick(() => {
-            this.onAltF4();
-          })
-        Button('显示桌面')
-          .layoutWeight(1)
-          .height(40)
-          .fontSize(13)
-          .fontColor(Color.White)
-          .backgroundColor('rgba(255, 255, 255, 0.18)')
-          .onClick(() => {
-            this.onShowDesktop();
-          })
+    Stack({ alignContent: Alignment.TopStart }) {
+      if (this.minimized) {
+        Button('鼠标').focusOnTouch(false).width(48).height(48).fontSize(12)
+          .focusOnTouch(false)
+          .onClick(() => { this.minimized = false; this.constrain(); })
+      } else {
+        Stack({ alignContent: Alignment.TopStart }) {
+          Circle().width(88).height(88).fill(Color.Transparent)
+            .stroke(this.ringHeld ? '#E6AC73' : '#8D9297').strokeWidth(1.5)
+            .strokeDashArray([1.5, 5]).position({ x: 2, y: 2 })
+            .hitTestBehavior(HitTestMode.None)
+          Circle().width(20).height(20).fill(this.ringHeld ? '#F0B67F' : '#D3D5D6')
+            .stroke('#767C80').strokeWidth(2)
+            .shadow({ radius: this.ringHeld ? 10 : 2, color: this.ringHeld ? '#BFE6A56B' : '#40000000' })
+            .position({
+              x: this.ringHeld ? 36 + 42 * Math.cos(this.ringAngle) : 36,
+              y: this.ringHeld ? 36 + 42 * Math.sin(this.ringAngle) : 98
+            }).hitTestBehavior(HitTestMode.None)
+        }
+        .width(92).height(120).position({ x: 42, y: 0 })
+        .id('floatingMouseScroll').hitTestBehavior(HitTestMode.Default)
+        .onTouch((event: TouchEvent) => this.ringTouch(event))
+        Stack() {
+          Path().width(36).height(78)
+            .commands(this.mousePath('M29 3 C23 -1 18 2 14 8 C-2 27 -2 51 14 70 C18 77 24 80 30 75 C35 71 35 66 31 61 C21 46 21 32 31 17 C35 12 35 7 29 3 Z'))
+            .fill((this.held & 1) !== 0 ? '#F0B67F' : '#D3D5D6')
+            .stroke('#767C80').strokeWidth(2).hitTestBehavior(HitTestMode.None)
+        }
+          .width(36).height(78).position({ x: 22, y: 126 }).id('floatingMouseLeft')
+          .accessibilityText('鼠标左键').hitTestBehavior(HitTestMode.Default)
+          .onTouch((event: TouchEvent) => this.buttonTouch(event, 0))
+        Stack() {
+          Path().width(36).height(78)
+            .commands(this.mousePath('M7 3 C13 -1 18 2 22 8 C38 27 38 51 22 70 C18 77 12 80 6 75 C1 71 1 66 5 61 C15 46 15 32 5 17 C1 12 1 7 7 3 Z'))
+            .fill((this.held & 4) !== 0 ? '#F0B67F' : '#D3D5D6')
+            .stroke('#767C80').strokeWidth(2).hitTestBehavior(HitTestMode.None)
+        }
+          .width(36).height(78).position({ x: 118, y: 126 }).id('floatingMouseRight')
+          .accessibilityText('鼠标右键').hitTestBehavior(HitTestMode.Default)
+          .onTouch((event: TouchEvent) => this.buttonTouch(event, 2))
+        Circle().width(52).height(52).fill('#D3D5D6')
+          .stroke('#767C80').strokeWidth(3)
+          .shadow({ radius: 2, color: '#50000000' }).position({ x: 62, y: 139 })
+          .accessibilityText('拖动移动光标，双击收起')
+          .id('floatingMouseMove').onTouch((event: TouchEvent) => this.centerTouch(event))
+        Stack() {
+          Circle().width(24).height(24)
+            .fill((this.held & 2) !== 0 ? '#F0B67F' : '#D3D5D6')
+            .stroke('#767C80').strokeWidth(1.5).hitTestBehavior(HitTestMode.None)
+          Path().width(24).height(24)
+            .commands(this.mousePath('M8 5 L16 5 M6 8 L18 8 M5 11 L19 11 M5 14 L19 14 M6 17 L18 17 M8 20 L16 20'))
+            .stroke('#858A8E').strokeWidth(1).fill(Color.Transparent).hitTestBehavior(HitTestMode.None)
+        }
+          .width(32).height(32).position({ x: 72, y: 210 }).id('floatingMouseMiddle')
+          .accessibilityText('鼠标中键').hitTestBehavior(HitTestMode.Default)
+          .onTouch((event: TouchEvent) => this.buttonTouch(event, 1))
       }
-      .width('100%')
-      Row({ space: 6 }) {
-        TextInput({
-          text: this.draft,
-          placeholder: this.passwordMode ? '有字点回车=发送，空框再点=回车' : '有字点回车=发送，空框再点=回车'
-        })
-          .layoutWeight(1)
-          .height(40)
-          .backgroundColor('#FF2A2A2A')
-          .fontColor(Color.White)
-          .placeholderColor('#88FFFFFF')
-          .caretColor(Color.White)
-          .type(this.passwordMode ? InputType.Password : InputType.Normal)
-          .enterKeyType(EnterKeyType.Send)
-          .onChange((value: string) => {
-            this.draft = value;
-          })
-          .onSubmit(() => {
-            this.submitDraft();
-          })
-        Button(this.passwordMode ? '密码' : '文本')
-          .constraintSize({ minWidth: 72 })
-          .height(40)
-          .padding({ left: 10, right: 10 })
-          .fontSize(14)
-          .backgroundColor(this.passwordMode ? '#1E88E5' : 'rgba(255,255,255,0.18)')
-          .fontColor(Color.White)
-          .onClick(() => {
-            this.passwordMode = !this.passwordMode;
-          })
-      }
-      .width('100%')
-      Row({ space: 4 }) {
-        Button('中英')
-          .layoutWeight(1)
-          .height(40)
-          .fontSize(12)
-          .padding({ left: 2, right: 2 })
-          .onClick(() => {
-            this.onImeToggle();
-          })
-        Button('空格')
-          .layoutWeight(1)
-          .height(40)
-          .fontSize(12)
-          .padding({ left: 2, right: 2 })
-          .onClick(() => {
-            this.onControl(30);
-          })
-        Button('Tab')
-          .layoutWeight(1)
-          .height(40)
-          .fontSize(12)
-          .padding({ left: 2, right: 2 })
-          .onClick(() => {
-            this.onControl(31);
-          })
-        Button('退格')
-          .layoutWeight(1)
-          .height(40)
-          .fontSize(12)
-          .padding({ left: 2, right: 2 })
-          .onClick(() => {
-            this.onControl(2);
-          })
-        Button(this.draft.length > 0 ? '发送' : '回车')
-          .layoutWeight(1)
-          .height(40)
-          .fontSize(12)
-          .padding({ left: 2, right: 2 })
-          .backgroundColor('#1E88E5')
-          .fontColor(Color.White)
-          .onClick(() => {
-            this.submitDraft();
-          })
-      }
-      .width('100%')
     }
-    .width('100%')
-    .padding(12)
-    .backgroundColor('rgba(0, 0, 0, 0.82)')
+    .width(this.minimized ? 48 : 176).height(this.minimized ? 48 : 248)
+    .position({ x: this.x, y: this.y }).hitTestBehavior(HitTestMode.Default)
+    .onTouch((event: TouchEvent) => event.stopPropagation())
+    .onAxisEvent((event: AxisEvent) => {
+      if (event.action !== AxisAction.CANCEL) { this.onWheelAxis(event.getVerticalAxisValue()); }
+    })
   }
 }
 
@@ -548,12 +1147,15 @@ struct HoldRightBtn {
 
   build() {
     Button('右键')
+      .focusOnTouch(false)
       .layoutWeight(1)
-      .height(44)
-      .fontSize(14)
+      .height(42)
+      .fontSize(12)
+      .padding({ left: 2, right: 2 })
       .fontColor(Color.White)
       .backgroundColor('rgba(255, 255, 255, 0.18)')
       .onTouch((event: TouchEvent) => {
+        event.stopPropagation();
         if (event.type === TouchType.Down) {
           this.onDown();
         } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
@@ -570,13 +1172,16 @@ struct HoldLeftBtn {
   onUp: () => void = () => {};
 
   build() {
-    Button(this.held ? '左键按下' : '左键')
+    Button(this.held ? '左键按' : '左键')
+      .focusOnTouch(false)
       .layoutWeight(1)
-      .height(44)
-      .fontSize(14)
+      .height(42)
+      .fontSize(12)
+      .padding({ left: 2, right: 2 })
       .fontColor(Color.White)
       .backgroundColor(this.held ? '#1E88E5' : 'rgba(255, 255, 255, 0.18)')
       .onTouch((event: TouchEvent) => {
+        event.stopPropagation();
         if (event.type === TouchType.Down) {
           this.held = true;
           this.onDown();
@@ -592,10 +1197,11 @@ struct HoldLeftBtn {
 @Component
 struct Session {
   @State viewOnly: boolean = false;
-  @State showToolbar: boolean = false;
+  @State chromeVisible: boolean = true;
+  @State displayMode: DisplayMode = DisplayMode.FIT;
   @State deskId: string = '';
   @State password: string = '';
-  @State isConnected: boolean = false;
+  @State @Watch('connectionInputChanged') isConnected: boolean = false;
   @State keepDesktop: boolean = false;
   @State connectionStatus: string = '未连接';
   @State connectionStep: string = '';
@@ -611,7 +1217,7 @@ struct Session {
   @State viewScale: number = 1;
   @State panX: number = 0;
   @State panY: number = 0;
-  @State virtualMouse: boolean = true;
+  @State virtualMouse: boolean = false;
   @State leftHeld: boolean = false;
   @State actionHint: string = '';
   @State textSelectMode: boolean = false;
@@ -619,11 +1225,12 @@ struct Session {
   @State wheelY: number = 120;
   @State wheelDragging: boolean = false;
 
+  private autoHideTimer: number = -1;
   private videoTimer: number = -1;
   private logTimer: number = -1;
   private lastHint: string = '';
-  private screenWidth: number = 360;
-  private screenHeight: number = 780;
+  @State screenWidth: number = 0;
+  @State screenHeight: number = 0;
   private wheelW: number = 44;
   private wheelH: number = 100;
   private wheelOffsetX: number = 0;
@@ -638,8 +1245,25 @@ struct Session {
   private firstFrameLogged: boolean = false;
   private firstTouchLogged: boolean = false;
   private nativeRef: HarmonyDeskNative | null = null;
-  private videoViewW: number = 360;
-  private videoViewH: number = 780;
+  private hardwareKeyboard: HardwareKeyboard | null = null;
+  private hardwarePointer: HardwarePointer | null = null;
+  @State remoteInputFocused: boolean = false;
+  private imeAttached: boolean = false;
+  private touchActive: boolean = false;
+  private windowInputActive: boolean = true;
+  private windowInputEvent: (event: window.WindowEventType) => void = (event: window.WindowEventType) => {
+    if (event === window.WindowEventType.WINDOW_INACTIVE || event === window.WindowEventType.WINDOW_HIDDEN) {
+      this.windowInputActive = false;
+      this.releaseRemoteInput();
+      this.remoteInputFocused = false;
+    } else if (event === window.WindowEventType.WINDOW_ACTIVE) {
+      this.windowInputActive = true;
+      this.focusRemoteInput();
+    }
+  };
+
+  private videoViewW: number = 0;
+  private videoViewH: number = 0;
   private touchDragging: boolean = false;
   private touchMoved: boolean = false;
   private rightClicked: boolean = false;
@@ -653,28 +1277,244 @@ struct Session {
   private everLoggedIn: boolean = false;
   private reconnectAttempt: number = 0;
   private reconnectInFlight: boolean = false;
+  private backgroundReleaseInFlight: Promise<void> = Promise.resolve();
   private readonly maxReconnectAttempts: number = 5;
+  private clipboard: ClipboardSync = new ClipboardSync();
+  @State clipboardSync: boolean = true;
+  @State clipboardStatus: string = '剪贴板同步准备中';
+  @State bottomControlsHeight: number = 72;
+  private previousKeyboardAvoidMode: UIKeyboardAvoidMode = UIKeyboardAvoidMode.OFFSET;
   private pinchStartScale: number = 1;
   private panStartX: number = 0;
   private panStartY: number = 0;
   private pinching: boolean = false;
-  private lastFingerX: number = 0;
-  private lastFingerY: number = 0;
-  private vmNeedAnchor: boolean = true;
+  @State keyboardInset: number = 0;
+  private sessionWindow: window.Window | null = null;
+  private floatingButtons: number = 0;
+  private keyboardHeight: (height: number) => void = (height: number) => {
+    this.keyboardInset = px2vp(height);
+    this.constrainWheelPosition();
+  };
+
+  private connectionInputChanged(): void {
+    if (!this.isConnected) {
+      this.releaseRemoteInput();
+      this.remoteInputFocused = false;
+    } else {
+      this.focusRemoteInput();
+    }
+  }
+
+  private inputReady(): boolean {
+    return this.isConnected && !this.viewOnly && this.nativeRef !== null && this.windowInputActive;
+  }
+
+  private focusRemoteInput(): void {
+    if (!this.inputReady()) { return; }
+    this.getUIContext().getFocusController().requestFocus('remoteInputSurface');
+    // Only onFocus confirms delivery: a focus request can fail or complete next frame.
+  }
+
+  private cancelDirectTouch(): void {
+    this.clearRightClickTimer();
+    if (this.touchDragging) { this.nativeRef?.sendMouseClick(0, false); }
+    this.touchActive = false;
+    this.touchDragging = false;
+    this.touchMoved = false;
+    this.rightClicked = false;
+  }
+
+  private releaseRemoteInput(): void {
+    this.hardwareKeyboard?.releaseAll();
+    this.hardwarePointer?.releaseAll();
+    this.cancelDirectTouch();
+    this.releaseFloatingButtons();
+    if (this.rightDown) { this.nativeRef?.sendMouseClick(2, false); }
+    this.rightDown = false;
+    this.imeAttached = false;
+  }
+
+  private handleHardwareKey(event: KeyEvent, afterIme: boolean = false): boolean {
+    if (!this.inputReady() || !this.remoteInputFocused || !this.nativeRef) { return false; }
+    if (!this.hardwareKeyboard) { this.hardwareKeyboard = new HardwareKeyboard(this.nativeRef); }
+    const down = event.type === KeyType.Down;
+    if (!down && event.type !== KeyType.Up) { return false; }
+    const unicode = event.unicode ?? 0;
+    const keyText = unicode >= 0x20 && unicode <= 0x10FFFF && !(unicode >= 0xD800 && unicode <= 0xDFFF)
+      ? String.fromCodePoint(unicode) : event.keyText;
+    const modifiers: number[] = [];
+    if (event.getModifierKeyState) {
+      if (event.getModifierKeyState(['ctrl'])) { modifiers.push(4); }
+      if (event.getModifierKeyState(['alt'])) { modifiers.push(1); }
+      if (event.getModifierKeyState(['shift'])) { modifiers.push(29); }
+    }
+    // Mirror Shift for remote Shift+click while allowing the local IME to see
+    // both edges (case changes and input-language switching).
+    if (this.imeAttached && (event.keyCode === KeyCode.KEYCODE_SHIFT_LEFT ||
+      event.keyCode === KeyCode.KEYCODE_SHIFT_RIGHT)) {
+      if (!afterIme) {
+        this.hardwareKeyboard.handle(event.keyCode, keyText, down, modifiers,
+          event.isCapsLockOn === true, event.isNumLockOn === true);
+      }
+      return false;
+    }
+    // A keyup must follow the route chosen by its keydown, even if Ctrl was
+    // released first. Text/composition stays with the attached system IME.
+    if (this.hardwareKeyboard.isPressed(event.keyCode)) {
+      return this.hardwareKeyboard.handle(event.keyCode, keyText, down, modifiers,
+        event.isCapsLockOn === true, event.isNumLockOn === true);
+    }
+    let shortcut = this.hardwareKeyboard.hasShortcutModifier();
+    shortcut = shortcut || modifiers.indexOf(4) >= 0 || modifiers.indexOf(1) >= 0;
+    if (!afterIme && this.imeAttached && !shortcut && this.hardwareKeyboard.shouldUseIme(event.keyCode)) { return false; }
+    return this.hardwareKeyboard.handle(event.keyCode, keyText, down, modifiers,
+      event.isCapsLockOn === true, event.isNumLockOn === true);
+  }
+
+  private handleHardwareMouse(event: MouseEvent): void {
+    if (!this.inputReady() || !this.nativeRef) { return; }
+    event.stopPropagation();
+    if (!this.hardwarePointer) { this.hardwarePointer = new HardwarePointer(this.nativeRef); }
+    const button = event.button === MouseButton.Left ? 0 :
+      (event.button === MouseButton.Right ? 2 : (event.button === MouseButton.Middle ? 1 : -1));
+    // Always release a tracked button, including over FIT black bars.
+    if (event.action === MouseAction.Release) {
+      this.hardwarePointer.button(button, false);
+      return;
+    }
+    const mapped = this.mapToRemote(event.x, event.y);
+    if (!mapped) { return; }
+    if (event.action === MouseAction.Press) {
+      this.cancelDirectTouch();
+      this.releaseFloatingButtons();
+      this.focusRemoteInput();
+    } else if (this.touchActive || this.floatingButtons !== 0) { return; }
+    this.cursorX = mapped[0];
+    this.cursorY = mapped[1];
+    TRACKPAD.cursorX = this.cursorX;
+    TRACKPAD.cursorY = this.cursorY;
+    this.hardwarePointer.move(this.cursorX, this.cursorY);
+    if (event.action === MouseAction.Press) { this.hardwarePointer.button(button, true); }
+  }
+
+  private handleHardwareWheel(event: AxisEvent): void {
+    if (!this.inputReady() || !this.nativeRef || this.touchActive || this.floatingButtons !== 0) { return; }
+    if (!this.hardwarePointer) { this.hardwarePointer = new HardwarePointer(this.nativeRef); }
+    if (event.action === AxisAction.CANCEL) { this.hardwarePointer.releaseAll(); return; }
+    const mapped = this.mapToRemote(event.x, event.y);
+    if (!mapped) { return; }
+    this.cursorX = mapped[0]; this.cursorY = mapped[1];
+    TRACKPAD.cursorX = this.cursorX; TRACKPAD.cursorY = this.cursorY;
+    this.hardwarePointer.move(this.cursorX, this.cursorY);
+    this.hardwarePointer.scroll(event.getVerticalAxisValue());
+  }
+
+  private handleFloatingWheel(axis: number): void {
+    if (!this.inputReady() || !this.nativeRef || this.touchActive || this.floatingButtons !== 0) { return; }
+    if (!this.hardwarePointer) { this.hardwarePointer = new HardwarePointer(this.nativeRef); }
+    this.hardwarePointer.move(this.cursorX, this.cursorY);
+    this.hardwarePointer.scroll(axis);
+  }
+
+  private releaseFloatingButtons(): void {
+    for (let button = 0; button < 3; button++) {
+      if ((this.floatingButtons & (1 << button)) !== 0) {
+        this.nativeRef?.sendMouseClick(button, false);
+      }
+    }
+    this.floatingButtons = 0;
+    this.leftHeld = false;
+    TRACKPAD.freezeMove = false;
+  }
+
+  private floatingButton(button: number, down: boolean): void {
+    if (!this.isConnected || this.viewOnly || !this.nativeRef) { return; }
+    if (down) {
+      this.hardwarePointer?.releaseAll();
+      this.cancelDirectTouch();
+      this.focusRemoteInput();
+    }
+    const mask = 1 << button;
+    if (((this.floatingButtons & mask) !== 0) === down) { return; }
+    this.clampCursor();
+    this.nativeRef.sendMouseMove(this.cursorX, this.cursorY);
+    this.nativeRef.sendMouseClick(button, down);
+    this.floatingButtons = down ? this.floatingButtons | mask : this.floatingButtons & ~mask;
+    this.leftHeld = (this.floatingButtons & 1) !== 0;
+    // Allow single-finger drag-select while only left is held: freeze only when a non-left button is down.
+    TRACKPAD.freezeMove = (this.floatingButtons & ~1) !== 0;
+    console.info(`[SessionUI] floating button=${button} down=${down}`);
+  }
+
+  private moveFloatingPointer(dx: number, dy: number): void {
+    if (!this.isConnected || this.viewOnly || !this.nativeRef) { return; }
+    this.hardwarePointer?.releaseAll();
+    this.cancelDirectTouch();
+    // Floating controls move in displayed desktop pixels, not full viewport
+    // pixels (which include FIT letterboxing). Keep a 1:1 on-screen movement.
+    if (VIEW.renderedW <= 0 || VIEW.renderedH <= 0) { return; }
+    this.cursorX += dx * this.remoteW / VIEW.renderedW;
+    this.cursorY += dy * this.remoteH / VIEW.renderedH;
+    this.clampCursor();
+    TRACKPAD.cursorX = this.cursorX;
+    TRACKPAD.cursorY = this.cursorY;
+    this.nativeRef.sendMouseMove(this.cursorX, this.cursorY);
+  }
+
+  private resetAutoHideTimer(): void {
+    if (this.autoHideTimer !== -1) {
+      clearTimeout(this.autoHideTimer);
+      this.autoHideTimer = -1;
+    }
+    if (!this.isConnected || this.textSelectMode) {
+      return;
+    }
+    this.autoHideTimer = setTimeout(() => {
+      if (this.isConnected && !this.textSelectMode) {
+        this.chromeVisible = false;
+      }
+    }, 7000);
+  }
+
+  private showChromeWithTimer(): void {
+    this.chromeVisible = true;
+    this.resetAutoHideTimer();
+  }
+
+  private clearAutoHideTimer(): void {
+    if (this.autoHideTimer !== -1) {
+      clearTimeout(this.autoHideTimer);
+      this.autoHideTimer = -1;
+    }
+  }
+
+  private toggleKeyboard(): void {
+    if (this.viewOnly) { return; }
+    this.focusRemoteInput();
+    this.showKeyboard = !this.showKeyboard;
+    this.resetAutoHideTimer();
+  }
 
   async aboutToAppear() {
     console.info('[Session] aboutToAppear called');
+    this.previousKeyboardAvoidMode = this.getUIContext().getKeyboardAvoidMode();
+    this.getUIContext().setKeyboardAvoidMode(UIKeyboardAvoidMode.NONE);
+    try {
+      this.sessionWindow = await window.getLastWindow(getContext(this));
+      this.sessionWindow.on('keyboardHeightChange', this.keyboardHeight);
+      this.sessionWindow.on('windowEvent', this.windowInputEvent);
+    } catch (_error) { console.error('[SessionUI] keyboard height listener unavailable'); }
 
     // 获取路由参数 - 尝试多种方式
     let params: Record<string, Object> | null = null;
-    
+
     try {
       params = router.getParams() as Record<string, Object> | null;
       console.info('[Session] router.getParams() id:', params ? String(params.id || '') : 'null');
     } catch (error) {
       console.error('[Session] router.getParams() error:', error);
     }
-    
+
     // 如果 getParams 返回 null，尝试延迟获取
     if (!params) {
       console.warn('[Session] Params is null, waiting 100ms and retry...');
@@ -688,14 +1528,14 @@ struct Session {
         console.error('[Session] Retry getParams() error:', error);
       }
     }
-    
+
     if (params) {
       // 安全地获取参数值
       this.deskId = String(params.id || params['id'] || '').trim();
       this.password = String(params.password || params['password'] || '').trim();
       this.deviceName = String(params.name || params['name'] || '').trim();
       this.viewOnly = String(params.viewOnly || params['viewOnly'] || '0') === '1' || params.viewOnly === true;
-      
+
       console.info('[Session] Parsed params - deskId:', this.deskId, 'password:', this.password ? '***' : '(empty)', 'name:', this.deviceName);
     } else {
       console.warn('[Session] No params received from router');
@@ -703,9 +1543,28 @@ struct Session {
       this.connectionStatus = '参数错误';
     }
 
-    VIEW.scale = 1;
-    VIEW.panX = 0;
-    VIEW.panY = 0;
+    try {
+      const disp = display.getDefaultDisplaySync();
+      if (disp && disp.width > 0 && disp.height > 0 && disp.densityPixels > 0) {
+        const dw = disp.width / disp.densityPixels;
+        const dh = disp.height / disp.densityPixels;
+        if (dw > 0 && dh > 0) {
+          this.screenWidth = dw;
+          this.screenHeight = dh;
+          this.videoViewW = dw;
+          this.videoViewH = dh;
+        }
+      }
+    } catch (_e) {
+    }
+
+    // Direct touch remains active; this flag only controls the optional panel.
+    this.virtualMouse = false;
+
+    runGeometrySanityChecks();
+
+    VIEW.reset();
+    this.syncView();
 
     if (this.deskId && this.deskId.trim().length > 0) {
       const isDemo = this.deskId.startsWith('DEMO') || this.deskId.startsWith('TEST');
@@ -725,15 +1584,22 @@ struct Session {
       this.errorMessage = '设备 ID 为空，无法连接';
       this.connectionStatus = '参数错误';
     }
-    
+
     console.info('[Session] aboutToAppear completed');
   }
 
   async aboutToDisappear() {
+    this.clipboard.stop();
+    this.getUIContext().setKeyboardAvoidMode(this.previousKeyboardAvoidMode);
+    this.sessionWindow?.off('keyboardHeightChange', this.keyboardHeight);
+    this.sessionWindow?.off('windowEvent', this.windowInputEvent);
+    this.releaseRemoteInput();
+    this.remoteInputFocused = false;
     this.intentionalDisconnect = true;
     this.reconnectInFlight = false;
     this.connectSeq++;
     DESK.pageAlive = false;
+    this.clearAutoHideTimer();
     SessionKeepAlive.setActive(false);
     if (DESK.pixelMap) {
       DESK.pixelMap.release();
@@ -754,282 +1620,554 @@ struct Session {
 
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
-      // 全屏远程画面
-      Column() {
-        Stack({ alignContent: Alignment.TopStart }) {
-          DesktopSurface()
-          if (this.virtualMouse && this.isConnected) {
-            CursorLayer()
-          }
-
-          // 选字条：画面底部内侧，落在底栏上方
-          if (this.isConnected && this.textSelectMode && !this.viewOnly) {
-            Row({ space: 6 }) {
-              Button('全选')
-                .height(34)
-                .fontSize(12)
-                .fontColor(Color.White)
-                .backgroundColor('rgba(40, 40, 44, 0.92)')
-                .onClick(() => {
-                  this.sendCtrlLetter('a');
-                })
-              Button('复制')
-                .height(34)
-                .fontSize(12)
-                .fontColor(Color.White)
-                .backgroundColor('rgba(40, 40, 44, 0.92)')
-                .onClick(() => {
-                  this.sendCtrlLetter('c');
-                })
-              Button('粘贴')
-                .height(34)
-                .fontSize(12)
-                .fontColor(Color.White)
-                .backgroundColor('rgba(40, 40, 44, 0.92)')
-                .onClick(() => {
-                  this.sendCtrlLetter('v');
-                })
-              Button('剪切')
-                .height(34)
-                .fontSize(12)
-                .fontColor(Color.White)
-                .backgroundColor('rgba(40, 40, 44, 0.92)')
-                .onClick(() => {
-                  this.sendCtrlLetter('x');
-                })
-              Button('完成')
-                .height(34)
-                .fontSize(12)
-                .fontColor(Color.White)
-                .backgroundColor('#1E88E5')
-                .onClick(() => {
-                  this.textSelectMode = false;
-                })
-            }
-            .padding({ left: 8, right: 8, top: 6, bottom: 6 })
-            .borderRadius(18)
-            .backgroundColor('rgba(0, 0, 0, 0.55)')
-            .margin({ left: 8, right: 48, bottom: 8 })
-            .align(Alignment.BottomStart)
-          }
-        }
-          .width('100%')
-          .layoutWeight(1)
-          .clip(true)
-          .backgroundColor('#000000')
-          .onAreaChange((_old: Area, area: Area) => {
-            this.videoViewW = Number(area.width);
-            this.videoViewH = Number(area.height);
-            this.syncView();
+      // 1. 全屏远程画面（主视口）及手势层：作为 Session 的最底层，铺满整个屏幕
+      Stack({ alignContent: Alignment.TopStart }) {
+        DesktopSurface()
+        // A container without a focusable descendant cannot receive keyboard focus.
+        // Keep an explicit leaf as the key target without intercepting pointer input.
+        Text('')
+          .width(1)
+          .height(1)
+          .opacity(0)
+          .hitTestBehavior(HitTestMode.None)
+          .id('remoteInputSurface')
+          .focusable(true)
+          .defaultFocus(true)
+          .onFocus(() => {
+            this.remoteInputFocused = true;
+            console.info('[SessionUI] hardware input focused');
           })
-          .onTouch((event: TouchEvent) => {
-            const point = event.changedTouches.length > 0 ? event.changedTouches[0] :
-              (event.touches.length > 0 ? event.touches[0] : null);
-            const px = point !== null ? point.x : -1;
-            const py = point !== null ? point.y : -1;
-            const wx = point !== null ? point.windowX : -1;
-            const wy = point !== null ? point.windowY : -1;
-            mouseTrace(`touch type=${event.type} vm=${this.virtualMouse ? 1 : 0} x=${px},${py} win=${wx},${wy} cur=${this.cursorX},${this.cursorY}`);
-            // 选字模式：手指直接拖选（绝对坐标），避免触摸板拖选太难
-            if (this.textSelectMode) {
-              this.handleRemoteTouch(event);
-              return;
-            }
-            if (this.virtualMouse) {
-              this.handleTrackpadPress(event, px, py);
-              return;
-            }
-            this.handleRemoteTouch(event);
+          .onBlur(() => {
+            this.remoteInputFocused = false;
+            this.releaseRemoteInput();
+            console.info('[SessionUI] hardware input blurred');
           })
-          .gesture(
-            GestureGroup(GestureMode.Parallel,
-              PinchGesture({ fingers: 2 })
-                .onActionStart(() => {
-                  this.pinchStartScale = VIEW.scale;
-                  this.pinching = true;
-                  this.touchMoved = true;
-                  this.clearRightClickTimer();
-                })
-                .onActionUpdate((event: GestureEvent) => {
-                  this.setViewScale(this.pinchStartScale * event.scale);
-                })
-                .onActionEnd(() => {
-                  this.pinching = false;
-                }),
-              PanGesture({ fingers: 2, direction: PanDirection.All })
-                .onActionStart(() => {
-                  this.panStartX = VIEW.panX;
-                  this.panStartY = VIEW.panY;
-                  this.pinching = true;
-                })
-                .onActionUpdate((event: GestureEvent) => {
-                  VIEW.panX = this.panStartX + event.offsetX;
-                  VIEW.panY = this.panStartY + event.offsetY;
-                  this.constrainPan();
-                })
-                .onActionEnd(() => {
-                  this.pinching = false;
-                }),
-              PanGesture({ fingers: 1, direction: PanDirection.All, distance: 10 })
-                .onActionStart((event: GestureEvent) => {
-                  this.beginTrackpadGesture(event);
-                })
-                .onActionUpdate((event: GestureEvent) => {
-                  this.moveTrackpadGesture(event.offsetX, event.offsetY);
-                })
-                .onActionEnd((event: GestureEvent) => {
-                  mouseTrace(`pan-end vm=${this.virtualMouse ? 1 : 0} off=${event.offsetX},${event.offsetY} cur=${TRACKPAD.cursorX},${TRACKPAD.cursorY}`);
-                })
-            )
-          )
-          .hitTestBehavior(HitTestMode.Default)
-
-        if (this.showKeyboard && this.isConnected) {
-          TypeBar({
-            onSend: (text: string) => {
-              DEBUG.note(`send text ${text.length}`);
-              this.nativeRef?.sendText(text);
-            },
-            onControl: (code: number) => {
-              this.nativeRef?.sendControlKey(code, true);
-            },
-            onImeToggle: () => {
-              this.nativeRef?.sendChord(32, 4);
-              DEBUG.note('中英 Ctrl+Space');
-            },
-            onCad: () => {
-              this.nativeRef?.sendControlKey(100, true);
-              DEBUG.note('Ctrl+Alt+Del');
-            },
-            onAltF4: () => {
-              // Alt=1, F4=15 → chord uses 1000+ControlKey
-              this.nativeRef?.sendChord(1015, 1);
-              DEBUG.note('Alt+F4');
-            },
-            onShowDesktop: () => {
-              // Meta/Win=23 + 'd'=100
-              this.nativeRef?.sendChord(100, 23);
-              DEBUG.note('Win+D 显示桌面');
-            }
-          })
-        }
-
+          .onKeyPreIme((event: KeyEvent): boolean => this.handleHardwareKey(event))
+          .onKeyEvent((event: KeyEvent): boolean => this.handleHardwareKey(event, true))
         if (this.virtualMouse && this.isConnected) {
-            Row({ space: 8 }) {
-              HoldLeftBtn({
-                onDown: () => {
-                  if (!this.nativeRef || this.viewOnly) {
-                    return;
-                  }
-                  TRACKPAD.freezeMove = true;
-                  this.nativeRef.sendMouseMove(this.cursorX, this.cursorY);
-                  this.nativeRef.sendMouseClick(0, true);
-                },
-                onUp: () => {
-                  if (!this.nativeRef) {
-                    return;
-                  }
-                  this.nativeRef.sendMouseClick(0, false);
-                  TRACKPAD.freezeMove = false;
-                }
-              })
-              HoldRightBtn({
-                onDown: () => {
-                  if (!this.nativeRef || this.viewOnly) {
-                    return;
-                  }
-                  this.touchMoved = false;
-                  this.rightClicked = false;
-                  this.sendRightButton(true);
-                },
-                onUp: () => {
-                  this.sendRightButton(false);
-                }
-              })
-              Button('键盘')
-                .height(44)
-                .fontSize(14)
-                .fontColor(Color.White)
-                .backgroundColor(this.showKeyboard ? '#1E88E5' : 'rgba(255, 255, 255, 0.18)')
-                .onClick(() => {
-                  this.showKeyboard = !this.showKeyboard;
-                  if (this.showKeyboard) {
-                    this.textSelectMode = false;
-                  }
-                })
-              Button(this.textSelectMode ? '选字中' : '选字')
-                .height(44)
-                .fontSize(14)
-                .fontColor(Color.White)
-                .backgroundColor(this.textSelectMode ? '#1E88E5' : 'rgba(255, 255, 255, 0.18)')
-                .onClick(() => {
-                  this.toggleTextSelectMode();
-                })
-            }
-            .width('100%')
-            .padding({ left: 12, right: 12, top: 8, bottom: 8 })
-            .backgroundColor('rgba(0, 0, 0, 0.72)')
-          }
+          CursorLayer()
+        }
       }
       .width('100%')
       .height('100%')
+      .clip(true)
+      .backgroundColor('#000000')
       .onAreaChange((_old: Area, area: Area) => {
-        this.screenWidth = Number(area.width) as number;
-        this.screenHeight = Number(area.height) as number;
-        if (!this.wheelInited && this.screenWidth > 0) {
-          this.wheelX = this.screenWidth - this.wheelW - 8;
-          this.wheelY = 96;
-          this.wheelInited = true;
-        }
-        if (!this.wheelDragging) {
-          this.constrainWheelPosition();
+        const w = Number(area.width);
+        const h = Number(area.height);
+        if (w > 0 && h > 0) {
+          this.videoViewW = w;
+          this.videoViewH = h;
+          this.syncView();
         }
       })
+      .onMouse((event: MouseEvent) => this.handleHardwareMouse(event))
+      .onHover((hovered: boolean) => { if (!hovered) { this.hardwarePointer?.releaseAll(); } })
+      .onAxisEvent((event: AxisEvent) => this.handleHardwareWheel(event))
+      .onTouch((event: TouchEvent) => {
+        // Mouse left buttons also synthesize touch events: only handle them once.
+        if (event.source === SourceType.Mouse) { return; }
+        if (event.type === TouchType.Down) { this.focusRemoteInput(); }
+        this.handleRemoteTouch(event);
+      })
+      .gesture(
+        GestureGroup(GestureMode.Parallel,
+          PinchGesture({ fingers: 2 })
+            .onActionStart(() => {
+              this.pinchStartScale = VIEW.userZoom;
+              this.cancelDirectTouch();
+              this.pinching = true;
+              this.touchMoved = true;
+              this.clearRightClickTimer();
+            })
+            .onActionUpdate((event: GestureEvent) => {
+              this.setViewScale(this.pinchStartScale * event.scale);
+            })
+            .onActionEnd(() => {
+              this.pinching = false;
+            })
+            .onActionCancel(() => {
+              this.pinching = false;
+              this.cancelDirectTouch();
+            }),
+          PanGesture({ fingers: 2, direction: PanDirection.All })
+            .onActionStart(() => {
+              this.panStartX = VIEW.panX;
+              this.panStartY = VIEW.panY;
+              this.cancelDirectTouch();
+              this.pinching = true;
+            })
+            .onActionUpdate((event: GestureEvent) => {
+              VIEW.panX = this.panStartX + event.offsetX;
+              VIEW.panY = this.panStartY + event.offsetY;
+              this.constrainPan();
+            })
+            .onActionEnd(() => {
+              this.pinching = false;
+            })
+            .onActionCancel(() => {
+              this.pinching = false;
+              this.cancelDirectTouch();
+            })
+        )
+      )
+      .hitTestBehavior(HitTestMode.Default)
 
-      // 顶部状态栏（连接后显示）
-      if (this.isConnected && this.showToolbar) {
-        Row({ space: 12 }) {
-          Button()
+      // 2. 选字快捷浮动条（悬浮居中，独立透明层）
+      if (this.isConnected && this.textSelectMode && !this.viewOnly) {
+        Stack({ alignContent: Alignment.Bottom }) {
+          Row({ space: 8 }) {
+            Button('全选')
+              .focusOnTouch(false)
+              .layoutWeight(1)
+              .height(36)
+              .fontSize(13)
+              .fontColor(Color.White)
+              .backgroundColor('rgba(255, 255, 255, 0.20)')
+              .onClick(() => {
+                this.sendCtrlLetter('a');
+              })
+            Button('复制')
+              .focusOnTouch(false)
+              .layoutWeight(1)
+              .height(36)
+              .fontSize(13)
+              .fontColor(Color.White)
+              .backgroundColor('rgba(255, 255, 255, 0.20)')
+              .onClick(() => {
+                this.sendCtrlLetter('c');
+              })
+            Button('粘贴')
+              .focusOnTouch(false)
+              .layoutWeight(1)
+              .height(36)
+              .fontSize(13)
+              .fontColor(Color.White)
+              .backgroundColor('rgba(255, 255, 255, 0.20)')
+              .onClick(() => {
+                this.sendCtrlLetter('v');
+              })
+            Button('剪切')
+              .focusOnTouch(false)
+              .layoutWeight(1)
+              .height(36)
+              .fontSize(13)
+              .fontColor(Color.White)
+              .backgroundColor('rgba(255, 255, 255, 0.20)')
+              .onClick(() => {
+                this.sendCtrlLetter('x');
+              })
+            Button('完成')
+              .focusOnTouch(false)
+              .layoutWeight(1)
+              .height(36)
+              .fontSize(13)
+              .fontColor(Color.White)
+              .backgroundColor('#1E88E5')
+              .onClick(() => {
+                this.toggleTextSelectMode();
+              })
+          }
+          .constraintSize({ maxWidth: 440 })
+          .width('92%')
+          .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+          .borderRadius(20)
+          .backgroundColor('rgba(20, 20, 24, 0.90)')
+          .shadow({ radius: 8, color: 'rgba(0, 0, 0, 0.35)' })
+          .margin({ bottom: this.keyboardInset + this.bottomControlsHeight + 8 })
+          .hitTestBehavior(HitTestMode.Default)
+        }
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.Transparent)
+      }
+
+      if (this.isConnected && this.virtualMouse && !this.viewOnly) {
+        FloatingMouse({
+          viewportW: this.screenWidth, viewportH: this.screenHeight, keyboardInset: this.keyboardInset + this.bottomControlsHeight,
+          onMove: (dx: number, dy: number) => this.moveFloatingPointer(dx, dy),
+          onButton: (button: number, down: boolean) => this.floatingButton(button, down),
+          onScroll: (delta: number) => this.sendScroll(delta),
+          onWheelAxis: (axis: number) => this.handleFloatingWheel(axis),
+          onRelease: () => this.releaseFloatingButtons()
+        })
+      }
+
+      // 3. 底部悬浮控制条与软键盘输入条（大屏居中悬浮、支持安全收起/展开）
+      if (this.isConnected) {
+        Column() {
+            // 软键盘输入条
+            if (this.remoteInputFocused && !this.viewOnly) {
+              TypeBar({
+                showSoftKeyboard: this.showKeyboard,
+                onReady: (ready: boolean) => { this.imeAttached = ready && this.remoteInputFocused && this.inputReady(); },
+                onSend: (text: string) => {
+                  DEBUG.note(`send text ${text.length}`);
+                  if (this.remoteInputFocused && this.inputReady()) { this.nativeRef?.sendText(text); }
+                },
+                onControl: (code: number) => {
+                  if (this.remoteInputFocused && this.inputReady()) { this.nativeRef?.sendControlKey(code, true); }
+                },
+                onClose: () => {
+                  this.showKeyboard = false;
+                  this.resetAutoHideTimer();
+                }
+              })
+                .constraintSize({ maxWidth: 680 })
+                .width('94%')
+                .margin({ bottom: this.showKeyboard ? 8 : 0 })
+                .borderRadius(14)
+                .clip(true)
+                .hitTestBehavior(HitTestMode.Default)
+            }
+
+            // 展开状态的底部控制条
+            if (this.chromeVisible) {
+              if (this.virtualMouse) {
+                Row({ space: 6 }) {
+                  Button('收起鼠标')
+                    .focusOnTouch(false)
+                    .layoutWeight(1)
+                    .height(42)
+                    .fontSize(12)
+                    .padding({ left: 2, right: 2 })
+                    .fontColor(Color.White)
+                    .backgroundColor('rgba(255, 255, 255, 0.18)')
+                    .onClick(() => {
+                      DEBUG.note('[SessionUI] touch click');
+                      this.releaseFloatingButtons();
+                      this.virtualMouse = false;
+                      this.resetAutoHideTimer();
+                      DEBUG.note('收起虚拟鼠标，直接触控保持可用');
+                    })
+                  Button('键盘')
+                    .focusOnTouch(false)
+                    .layoutWeight(1)
+                    .height(42)
+                    .fontSize(12)
+                    .padding({ left: 2, right: 2 })
+                    .fontColor(Color.White)
+                    .backgroundColor(this.showKeyboard ? '#1E88E5' : 'rgba(255, 255, 255, 0.18)')
+                    .onClick(() => {
+                      DEBUG.note('[SessionUI] keyboard click');
+                      this.toggleKeyboard();
+                    })
+                  Button(this.textSelectMode ? '选字中' : '选字')
+                    .focusOnTouch(false)
+                    .layoutWeight(1)
+                    .height(42)
+                    .fontSize(12)
+                    .padding({ left: 2, right: 2 })
+                    .fontColor(Color.White)
+                    .backgroundColor(this.textSelectMode ? '#1E88E5' : 'rgba(255, 255, 255, 0.18)')
+                    .onClick(() => {
+                      this.toggleTextSelectMode();
+                    })
+                  Button(this.displayModeLabel)
+                    .focusOnTouch(false)
+                    .layoutWeight(1)
+                    .height(42)
+                    .fontSize(12)
+                    .padding({ left: 2, right: 2 })
+                    .fontColor(Color.White)
+                    .backgroundColor(this.displayMode === DisplayMode.FIT ? 'rgba(255, 255, 255, 0.18)' : '#1E88E5')
+                    .onClick(() => {
+                      this.cycleDisplayMode();
+                      this.resetAutoHideTimer();
+                    })
+                  Button('断开')
+                    .focusOnTouch(false)
+                    .layoutWeight(1)
+                    .height(42)
+                    .fontSize(12)
+                    .padding({ left: 2, right: 2 })
+                    .fontColor(Color.White)
+                    .backgroundColor('rgba(229, 57, 53, 0.85)')
+                    .onClick(() => {
+                      DEBUG.note('[SessionUI] disconnect click');
+                      this.disconnect();
+                      router.back();
+                    })
+                  Button('收起')
+                    .focusOnTouch(false)
+                    .layoutWeight(1)
+                    .height(42)
+                    .fontSize(12)
+                    .padding({ left: 2, right: 2 })
+                    .fontColor(Color.White)
+                    .backgroundColor('rgba(255, 255, 255, 0.18)')
+                    .onClick(() => {
+                      DEBUG.note('[SessionUI] collapse click');
+                      this.chromeVisible = false;
+                      this.clearAutoHideTimer();
+                    })
+                }
+                .constraintSize({ maxWidth: 660 })
+                .width('94%')
+                .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+                .borderRadius(18)
+                .backgroundColor('rgba(20, 20, 24, 0.82)')
+                .shadow({ radius: 8, color: 'rgba(0, 0, 0, 0.35)' })
+                .hitTestBehavior(HitTestMode.Default)
+              } else {
+                Row({ space: 6 }) {
+                  Button('虚拟鼠标')
+                    .focusOnTouch(false)
+                    .layoutWeight(1)
+                    .height(42)
+                    .fontSize(12)
+                    .padding({ left: 2, right: 2 })
+                    .fontColor(Color.White)
+                    .backgroundColor('#1E88E5')
+                    .onClick(() => {
+                      DEBUG.note('[SessionUI] mouse click');
+                      this.virtualMouse = true;
+                      this.clampCursor();
+                      this.resetAutoHideTimer();
+                      DEBUG.note('显示虚拟鼠标，直接触控保持可用');
+                    })
+                  Button('键盘')
+                    .focusOnTouch(false)
+                    .layoutWeight(1)
+                    .height(42)
+                    .fontSize(12)
+                    .padding({ left: 2, right: 2 })
+                    .fontColor(Color.White)
+                    .backgroundColor(this.showKeyboard ? '#1E88E5' : 'rgba(255, 255, 255, 0.18)')
+                    .onClick(() => {
+                      DEBUG.note('[SessionUI] keyboard click');
+                      this.toggleKeyboard();
+                    })
+                  Button(this.textSelectMode ? '选字中' : '选字')
+                    .focusOnTouch(false)
+                    .layoutWeight(1)
+                    .height(42)
+                    .fontSize(12)
+                    .padding({ left: 2, right: 2 })
+                    .fontColor(Color.White)
+                    .backgroundColor(this.textSelectMode ? '#1E88E5' : 'rgba(255, 255, 255, 0.18)')
+                    .onClick(() => {
+                      this.toggleTextSelectMode();
+                    })
+                  Button(this.displayModeLabel)
+                    .focusOnTouch(false)
+                    .layoutWeight(1)
+                    .height(42)
+                    .fontSize(12)
+                    .padding({ left: 2, right: 2 })
+                    .fontColor(Color.White)
+                    .backgroundColor(this.displayMode === DisplayMode.FIT ? 'rgba(255, 255, 255, 0.18)' : '#1E88E5')
+                    .onClick(() => {
+                      this.cycleDisplayMode();
+                      this.resetAutoHideTimer();
+                    })
+                  Button('断开')
+                    .focusOnTouch(false)
+                    .layoutWeight(1)
+                    .height(42)
+                    .fontSize(12)
+                    .padding({ left: 2, right: 2 })
+                    .fontColor(Color.White)
+                    .backgroundColor('rgba(229, 57, 53, 0.85)')
+                    .onClick(() => {
+                      DEBUG.note('[SessionUI] disconnect click');
+                      this.disconnect();
+                      router.back();
+                    })
+                  Button('收起')
+                    .focusOnTouch(false)
+                    .layoutWeight(1)
+                    .height(42)
+                    .fontSize(12)
+                    .padding({ left: 2, right: 2 })
+                    .fontColor(Color.White)
+                    .backgroundColor('rgba(255, 255, 255, 0.18)')
+                    .onClick(() => {
+                      DEBUG.note('[SessionUI] collapse click');
+                      this.chromeVisible = false;
+                      this.clearAutoHideTimer();
+                    })
+                }
+                .constraintSize({ maxWidth: 540 })
+                .width('94%')
+                .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+                .borderRadius(18)
+                .backgroundColor('rgba(20, 20, 24, 0.82)')
+                .shadow({ radius: 8, color: 'rgba(0, 0, 0, 0.35)' })
+                .hitTestBehavior(HitTestMode.Default)
+              }
+            }
+
+            // 收起状态的极简浮动恢复胶囊
+            if (!this.chromeVisible) {
+              Row({ space: 8 }) {
+                Circle({ width: 7, height: 7 })
+                  .fill('#4CAF50')
+                Text(this.deviceName || this.deskId)
+                  .fontSize(12)
+                  .fontColor(Color.White)
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .constraintSize({ maxWidth: 140 })
+                Text(this.virtualMouse ? '已连·触控+鼠标' : '已连·触控')
+                  .fontSize(11)
+                  .fontColor('rgba(255, 255, 255, 0.70)')
+                Button('展开')
+                  .focusOnTouch(false)
+                  .type(ButtonType.Capsule)
+                  .height(32)
+                  .fontSize(12)
+                  .padding({ left: 12, right: 12 })
+                  .fontColor(Color.White)
+                  .backgroundColor('#1E88E5')
+                  .onClick(() => {
+                    DEBUG.note('[SessionUI] expand click');
+                    this.showChromeWithTimer();
+                  })
+                Button('断开')
+                  .focusOnTouch(false)
+                  .type(ButtonType.Capsule)
+                  .height(32)
+                  .fontSize(12)
+                  .padding({ left: 12, right: 12 })
+                  .fontColor(Color.White)
+                  .backgroundColor('rgba(229, 57, 53, 0.85)')
+                  .onClick(() => {
+                    DEBUG.note('[SessionUI] disconnect click');
+                    this.disconnect();
+                    router.back();
+                  })
+              }
+              .padding({ left: 12, right: 8, top: 4, bottom: 4 })
+              .borderRadius(18)
+              .backgroundColor('rgba(20, 20, 24, 0.75)')
+              .shadow({ radius: 8, color: 'rgba(0, 0, 0, 0.3)' })
+              .hitTestBehavior(HitTestMode.Default)
+            }
+          }
+        .width('100%')
+        .padding({ left: 12, right: 12, bottom: 10 })
+        .alignItems(HorizontalAlign.Center)
+        .position({ left: 0, bottom: this.keyboardInset })
+        .id('sessionBottomControls')
+        .onAreaChange((_old: Area, area: Area) => {
+          this.bottomControlsHeight = Number(area.height);
+          this.constrainWheelPosition();
+        })
+        .hitTestBehavior(HitTestMode.Transparent)
+        .onTouch((event: TouchEvent) => {
+          event.stopPropagation();
+          if (event.type === TouchType.Down) { this.clearAutoHideTimer(); }
+          if (event.type === TouchType.Up || event.type === TouchType.Cancel) { this.resetAutoHideTimer(); }
+        })
+      }
+
+      // 4. 顶部悬浮状态栏（大屏胶囊式悬浮，非全宽遮挡，chromeVisible 时显示）
+      if (this.isConnected && this.chromeVisible) {
+        Stack({ alignContent: Alignment.Top }) {
+          Row({ space: 10 }) {
+            Button() {
+              Text('‹')
+                .fontSize(22)
+                .fontColor(Color.White)
+                .fontWeight(FontWeight.Bold)
+                .margin({ bottom: 2 })
+            }
             .type(ButtonType.Circle)
             .width(36)
             .height(36)
-            .backgroundColor($r('app.color.card_background'))
-            .onClick(() => {
-              router.back();
+            .responseRegion({ x: -6, y: -6, width: 48, height: 48 })
+            .backgroundColor('rgba(255, 255, 255, 0.16)')
+            .onTouch((event: TouchEvent) => {
+              event.stopPropagation();
             })
-          .stateEffect(true)
-
-          Column({ space: 2 }) {
-            Text(this.deviceName || this.deskId)
-              .fontSize(16)
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('app.color.text_primary'))
-            Text('已连接')
-              .fontSize(12)
-              .fontColor($r('app.color.status_online'))
-          }
-          .layoutWeight(1)
-          .alignItems(HorizontalAlign.Start)
-
-          Button('断开')
-            .type(ButtonType.Capsule)
-            .fontSize(13)
-            .height(32)
-            .fontColor($r('app.color.text_on_accent'))
-            .backgroundColor($r('app.color.accent'))
             .onClick(() => {
               this.disconnect();
               router.back();
             })
+
+            Column({ space: 2 }) {
+              Row({ space: 6 }) {
+                Circle({ width: 7, height: 7 })
+                  .fill('#4CAF50')
+                Text(this.deviceName || this.deskId)
+                  .fontSize(14)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor(Color.White)
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .constraintSize({ maxWidth: 220 })
+              }
+              Text(this.remoteW > 0 && this.remoteH > 0
+                ? `${this.remoteW}×${this.remoteH} · ${this.virtualMouse ? '触控+虚拟鼠标' : '直接触控'}`
+                : (this.virtualMouse ? '触控+虚拟鼠标' : '直接触控'))
+                .fontSize(11)
+                .fontColor('rgba(255, 255, 255, 0.65)')
+              if (!this.viewOnly) {
+                Text(this.clipboardSync ? this.clipboardStatus : '剪贴板同步已关闭 · 点此开启')
+                  .fontSize(11).fontColor('#B8D9FF')
+                  .id('clipboardSyncToggle')
+                  .onClick(() => {
+                    this.clipboardSync = !this.clipboardSync;
+                    if (this.clipboardSync) { this.startClipboardSync(); }
+                    else { this.clipboard.stop(); }
+                  })
+              }
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+
+            Button('收起')
+              .focusOnTouch(false)
+              .type(ButtonType.Capsule)
+              .fontSize(12)
+              .height(34)
+              .padding({ left: 12, right: 12 })
+              .fontColor(Color.White)
+              .backgroundColor('rgba(255, 255, 255, 0.16)')
+              .onTouch((event: TouchEvent) => {
+                event.stopPropagation();
+              })
+              .onClick(() => {
+                this.chromeVisible = false;
+                this.clearAutoHideTimer();
+              })
+
+            Button('断开')
+              .focusOnTouch(false)
+              .type(ButtonType.Capsule)
+              .fontSize(13)
+              .height(34)
+              .padding({ left: 14, right: 14 })
+              .fontColor(Color.White)
+              .backgroundColor('#E53935')
+              .onTouch((event: TouchEvent) => {
+                event.stopPropagation();
+              })
+              .onClick(() => {
+                this.disconnect();
+                router.back();
+              })
+          }
+          .constraintSize({ maxWidth: 580 })
+          .width('94%')
+          .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+          .borderRadius(20)
+          .backgroundColor('rgba(20, 20, 24, 0.78)')
+          .shadow({ radius: 10, color: 'rgba(0, 0, 0, 0.35)', offsetY: 2 })
+          .margin({ top: 12 })
+          .hitTestBehavior(HitTestMode.Block)
+          .onTouch((event: TouchEvent) => {
+            event.stopPropagation();
+          })
         }
         .width('100%')
-        .padding({ left: 16, right: 16, top: 12, bottom: 12 })
-        .backgroundColor($r('app.color.card_background'))
-        .shadow({ radius: 8, color: 'rgba(0, 0, 0, 0.1)' })
+        .height('100%')
+        .hitTestBehavior(HitTestMode.Transparent)
       }
 
-      // 滚轮悬浮条（RustDesk 风格：半透明一体、可拖拽）
-      if (this.isConnected && !this.viewOnly && !this.showKeyboard) {
+      // 5. 滚轮悬浮条（RustDesk 风格：半透明一体、可拖拽）
+      if (this.isConnected && !this.viewOnly && !this.virtualMouse) {
         Stack({ alignContent: Alignment.TopStart }) {
           Column() {
             Column() {
@@ -1071,10 +2209,11 @@ struct Session {
           .height(this.wheelH)
           .borderRadius(22)
           .clip(true)
-          .backgroundColor('rgba(40, 40, 44, 0.55)')
-          .shadow({ radius: 8, color: 'rgba(0, 0, 0, 0.22)', offsetY: 2 })
-          .opacity(this.wheelDragging ? 0.9 : 0.72)
+          .backgroundColor('rgba(30, 30, 36, 0.65)')
+          .shadow({ radius: 8, color: 'rgba(0, 0, 0, 0.25)', offsetY: 2 })
+          .opacity(this.wheelDragging ? 0.95 : 0.75)
           .margin({ left: this.wheelX, top: this.wheelY })
+          .hitTestBehavior(HitTestMode.Block)
           .gesture(
             PanGesture({ direction: PanDirection.All, distance: 6 })
               .onActionStart((event: GestureEvent) => {
@@ -1093,7 +2232,6 @@ struct Session {
               })
               .onActionEnd(() => {
                 this.wheelDragging = false;
-                // 短延迟后再清，避免拖完立刻误触 onClick
                 setTimeout(() => {
                   this.wheelMoved = false;
                 }, 80);
@@ -1105,69 +2243,121 @@ struct Session {
         .hitTestBehavior(HitTestMode.Transparent)
       }
 
+      // 6. 未连接状态对话框
       if (!this.isConnected && !this.keepDesktop) {
-        Stack() {
-          Column({ space: 12 }) {
-            Text(this.reconnectHint.length > 0 ? this.reconnectHint : '正在连接...')
+        Stack({ alignContent: Alignment.Center }) {
+          Column({ space: 14 }) {
+            if (!this.errorMessage) {
+              LoadingProgress()
+                .width(36)
+                .height(36)
+                .color($r('app.color.accent'))
+            }
+            Text(this.reconnectHint.length > 0 ? this.reconnectHint : (this.connectionStatus || '正在连接...'))
               .fontSize(16)
+              .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_primary'))
+            if (this.connectionStep.length > 0 && !this.errorMessage) {
+              Text(this.connectionStep)
+                .fontSize(13)
+                .fontColor($r('app.color.text_secondary'))
+            }
             if (this.errorMessage) {
               Text(this.errorMessage)
                 .fontSize(14)
                 .fontColor($r('app.color.status_offline'))
+                .textAlign(TextAlign.Center)
               Button('返回')
+                .focusOnTouch(false)
                 .type(ButtonType.Capsule)
+                .height(36)
+                .fontSize(14)
+                .padding({ left: 24, right: 24 })
+                .backgroundColor($r('app.color.accent'))
+                .fontColor(Color.White)
                 .onClick(() => {
                   router.back();
                 })
             }
           }
-          .padding(20)
-          .borderRadius(16)
+          .constraintSize({ maxWidth: 400 })
+          .width('85%')
+          .padding(24)
+          .borderRadius(20)
           .backgroundColor($r('app.color.card_background'))
-          .align(Alignment.Center)
+          .shadow({ radius: 16, color: 'rgba(0, 0, 0, 0.25)' })
+          .hitTestBehavior(HitTestMode.Block)
         }
         .width('100%')
         .height('100%')
         .hitTestBehavior(HitTestMode.Transparent)
       }
 
-      // 短线重连提示（保留最后一帧画面）
+      // 7. 短线重连提示（保留最后一帧画面）
       if (this.reconnectHint.length > 0 && this.keepDesktop) {
-        Row() {
-          Text(this.reconnectHint)
-            .fontSize(13)
-            .fontColor(Color.White)
-            .layoutWeight(1)
+        Stack({ alignContent: Alignment.Top }) {
+          Row({ space: 8 }) {
+            LoadingProgress()
+              .width(18)
+              .height(18)
+              .color(Color.White)
+            Text(this.reconnectHint)
+              .fontSize(13)
+              .fontColor(Color.White)
+              .layoutWeight(1)
+          }
+          .constraintSize({ maxWidth: 480 })
+          .width('90%')
+          .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+          .borderRadius(14)
+          .backgroundColor('rgba(30, 136, 229, 0.90)')
+          .shadow({ radius: 8, color: 'rgba(0, 0, 0, 0.25)' })
+          .margin({ top: 60 })
+          .hitTestBehavior(HitTestMode.None)
         }
         .width('100%')
-        .padding({ left: 14, right: 14, top: 10, bottom: 10 })
-        .backgroundColor('#CC1E88E5')
-        .margin({ top: 48 })
-        .hitTestBehavior(HitTestMode.None)
+        .height('100%')
+        .hitTestBehavior(HitTestMode.Transparent)
       }
     }
     .width('100%')
     .height('100%')
     .backgroundColor($r('app.color.app_background_top'))
-    .expandSafeArea([SafeAreaType.KEYBOARD], [SafeAreaEdge.BOTTOM])
+    .expandSafeArea([SafeAreaType.KEYBOARD, SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+    .onAreaChange((_old: Area, area: Area) => {
+      const w = Number(area.width);
+      const h = Number(area.height);
+      if (w > 0 && h > 0) {
+        this.screenWidth = w;
+        this.screenHeight = h;
+        if (!this.wheelInited) {
+          this.wheelX = this.screenWidth - this.wheelW - 12;
+          this.wheelY = 96;
+          this.wheelInited = true;
+        }
+        if (!this.wheelDragging) {
+          this.constrainWheelPosition();
+        }
+      }
+    })
   }
 
   private constrainWheelPosition(): void {
-    const margin = 4;
+    const margin = 8;
     if (this.wheelX < margin) {
       this.wheelX = margin;
     }
     if (this.wheelX > this.screenWidth - this.wheelW - margin) {
       this.wheelX = Math.max(margin, this.screenWidth - this.wheelW - margin);
     }
-    if (this.wheelY < margin) {
-      this.wheelY = margin;
+    const topLimit = 64;
+    if (this.wheelY < topLimit) {
+      this.wheelY = topLimit;
     }
     // 底部留出底栏空间
-    const bottomLimit = this.screenHeight - this.wheelH - 120;
+    const bottomLimit = this.screenHeight - this.keyboardInset - this.bottomControlsHeight - this.wheelH - 8;
     if (this.wheelY > bottomLimit) {
-      this.wheelY = Math.max(margin, bottomLimit);
+      this.wheelY = Math.max(topLimit, bottomLimit);
     }
   }
 
@@ -1197,6 +2387,7 @@ struct Session {
       this.reconnectHint = '';
     }
 
+    this.clipboard.stop();
     const seq = ++this.connectSeq;
     if (!isReconnect) {
       this.connectionLogs = [];
@@ -1219,6 +2410,7 @@ struct Session {
 
       const nativeMod = await import('../native/HarmonyDeskNative');
       const native = await nativeMod.getNativeModule();
+      if (seq !== this.connectSeq || this.intentionalDisconnect) { return; }
       if (!native) {
         throw new Error('原生模块不可用');
       }
@@ -1243,6 +2435,7 @@ struct Session {
         const store = new RustDeskStore();
         await store.init(context);
         const relay = await store.loadRelay();
+        if (seq !== this.connectSeq || this.intentionalDisconnect) { return; }
         const idServer = relay.apiHost.trim();
         const key = isPlaceholderKey(relay.key) ? '' : relay.key.trim();
         const ipDirect = isDirectIpId(this.deskId);
@@ -1276,7 +2469,7 @@ struct Session {
 
       this.addLog('原生模块已就绪');
       this.connectionStep = '正在连接到远程桌面';
-      
+
       // 再次确保UI更新
       await new Promise<void>((resolve) => {
         setTimeout(() => resolve(), 50);
@@ -1284,11 +2477,12 @@ struct Session {
 
       // 调用原生连接方法（在后台执行，避免阻塞UI）
       this.addLog('调用原生连接接口...');
-      
+
       // 使用 Promise 包装同步调用，避免阻塞UI线程
       const result = await new Promise<number>((resolve) => {
         // 使用 setTimeout 将同步调用移到下一个事件循环，让UI有时间更新
         setTimeout(() => {
+          if (seq !== this.connectSeq || this.intentionalDisconnect) { resolve(-1); return; }
           try {
             const connectResult = native.connect(this.deskId, this.password ?? '');
             resolve(connectResult);
@@ -1299,6 +2493,7 @@ struct Session {
         }, 100);
       });
 
+      if (seq !== this.connectSeq || this.intentionalDisconnect) { return; }
       this.addLog(`连接返回结果: ${result}`);
 
       const isDemo = this.deskId.startsWith('DEMO') || this.deskId.startsWith('TEST');
@@ -1339,6 +2534,7 @@ struct Session {
             this.demoHint = '已登录，正在等待视频帧';
             this.addLog(isReconnect ? '✓ 短线重连成功' : '✓ 登录成功，保持会话并等待画面');
             this.armSessionKeepAlive();
+            this.showChromeWithTimer();
             this.addLog(isDirectIpId(this.deskId)
               ? 'IP 直连：统一画质 custom 100/60fps'
               : '中继：统一画质 custom 100/60fps');
@@ -1361,8 +2557,11 @@ struct Session {
               }
             } catch (_error) {
             }
+            if (seq !== this.connectSeq || this.intentionalDisconnect) { return; }
             this.startLogPump();
             this.nativeRef = native;
+            this.focusRemoteInput();
+            this.startClipboardSync();
             return;
           } else if (logs.includes('RESULT: LOGIN_ERROR')) {
             this.connectionStatus = '登录失败';
@@ -1464,6 +2663,7 @@ struct Session {
         this.connectionStep = '连接成功';
         this.addLog('✓ 连接成功');
         this.armSessionKeepAlive();
+        this.showChromeWithTimer();
       } else {
         this.isConnected = false;
         this.connectionStatus = '连接失败';
@@ -1481,6 +2681,7 @@ struct Session {
         }
       }
     } catch (error) {
+      if (seq !== this.connectSeq || this.intentionalDisconnect) { return; }
       this.isConnected = false;
       this.connectionStatus = '连接错误';
       this.connectionStep = '发生错误';
@@ -1530,10 +2731,134 @@ struct Session {
     }, delayMs);
   }
 
+  private startClipboardSync(): void {
+    if (!this.nativeRef || !this.isConnected || this.viewOnly || !this.clipboardSync) { return; }
+    const seq = this.connectSeq;
+    this.clipboard.start(this.nativeRef, getContext(this) as common.UIAbilityContext,
+      () => this.isConnected && !this.viewOnly && this.clipboardSync && this.connectSeq === seq,
+      (status: string) => { this.clipboardStatus = status; });
+  }
+
   private armSessionKeepAlive(): void {
-    SessionKeepAlive.setActive(true, () => {
-      void this.disconnect();
-    });
+    // Two distinct callbacks:
+    //   - onBackgroundTimeout: fires after the bounded background hold
+    //     expires. Used to tear down the native session and mark the page
+    //     state as "resumable" (not user-intentional). Must NOT set
+    //     intentionalDisconnect=true — the next foreground should trigger
+    //     the reconnect path automatically.
+    //   - onForegroundResume: fires from EntryAbility.onForeground only
+    //     when a background-timeout teardown latched; re-establishes the
+    //     prior remote session via connect(true) (existing reconnect path).
+    // The user-explicit 断开 button and aboutToDisappear still go through
+    // this.disconnect() directly, which sets intentionalDisconnect=true
+    // and calls SessionKeepAlive.setActive(false) to suppress any resume.
+    SessionKeepAlive.setActive(
+      true,
+      () => { this.backgroundReleaseInFlight = this.releaseForBackgroundTimeout(); },
+      () => { void this.resumeFromBackground(); },
+      (foreground: boolean) => {
+        this.clipboard.setForeground(foreground);
+        if (!foreground) { this.releaseRemoteInput(); this.remoteInputFocused = false; }
+      }
+    );
+  }
+
+  /**
+   * Background-hold timeout fired: tear down the native session + UI
+   * timers but leave the Session page "resumable" so the next foreground
+   * can re-establish the prior remote connection without a user tap.
+   *
+   * Deliberately does NOT:
+   *   - set intentionalDisconnect=true (that flags a final user disconnect)
+   *   - reset reconnectAttempt (preserves existing reconnect bookkeeping)
+   *   - call SessionKeepAlive.setActive(false) (the latch + remaining
+   *     handlers must stay armed so onForeground can fire the resume
+   *     callback on this same teardown)
+   */
+  private async releaseForBackgroundTimeout(): Promise<void> {
+    this.clipboard.stop();
+    DEBUG.note('[Session] releaseForBackgroundTimeout (resumable)');
+    this.clearAutoHideTimer();
+    this.showKeyboard = false;
+    this.releaseRemoteInput();
+    this.remoteInputFocused = false;
+    if (this.videoTimer !== -1) {
+      clearInterval(this.videoTimer);
+      this.videoTimer = -1;
+    }
+    if (this.logTimer !== -1) {
+      clearInterval(this.logTimer);
+      this.logTimer = -1;
+    }
+    if (this.longPressTimer !== -1) {
+      clearTimeout(this.longPressTimer);
+      this.longPressTimer = -1;
+    }
+    // Invalidate any in-flight clipboard / pointer ops for the prior
+    // generation; this does not affect reconnect because connect() bumps
+    // connectSeq itself.
+    this.connectSeq++;
+    try {
+      const nativeMod = await import('../native/HarmonyDeskNative');
+      const native = await nativeMod.getNativeModule();
+      if (native) {
+        native.disconnect();
+      }
+    } catch (_e) {
+    }
+    this.isConnected = false;
+    this.connectionStatus = '后台已暂停';
+    this.errorMessage = '';
+    this.demoHint = '从后台返回后会自动重连';
+  }
+
+  /**
+   * EntryAbility.onForeground dispatched this via SessionKeepAlive. If
+   * the page is still alive (no user-explicit disconnect, page still on
+   * the router stack, no concurrent reconnect in flight), call the
+   * existing reconnect path to re-establish the prior remote session.
+   * Honors all existing safety semantics: intentionalDisconnect gates
+   * reconnect, viewOnly is allowed only after a prior successful login,
+   * reconnectInFlight dedupe, pageAlive gate, etc.
+   */
+  private async resumeFromBackground(): Promise<void> {
+    if (this.intentionalDisconnect) {
+      DEBUG.note('resumeFromBackground: skipped (intentionalDisconnect)');
+      return;
+    }
+    if (!DESK.pageAlive) {
+      DEBUG.note('resumeFromBackground: skipped (pageAlive=false)');
+      return;
+    }
+    if (!this.deskId || this.deskId.trim().length === 0) {
+      DEBUG.note('resumeFromBackground: skipped (no deskId)');
+      return;
+    }
+    if (this.reconnectInFlight) {
+      DEBUG.note('resumeFromBackground: skipped (reconnectInFlight)');
+      return;
+    }
+    if (this.viewOnly && !this.everLoggedIn) {
+      DEBUG.note('resumeFromBackground: skipped (viewOnly, never logged in)');
+      return;
+    }
+    if (!SessionKeepAlive.isActive() && !SessionKeepAlive.isPendingResume()) {
+      DEBUG.note('resumeFromBackground: skipped (no pending resume)');
+      return;
+    }
+    const backgroundRelease = this.backgroundReleaseInFlight;
+    SessionKeepAlive.consumePendingResume();
+    await backgroundRelease;
+    if (this.intentionalDisconnect || !DESK.pageAlive || this.reconnectInFlight ||
+        (this.viewOnly && !this.everLoggedIn)) {
+      DEBUG.note('resumeFromBackground: skipped (gate changed during background release)');
+      return;
+    }
+    DEBUG.note('[Session] resumeFromBackground: auto reconnect');
+    this.reconnectAttempt = 0;
+    this.connectionStatus = '后台返回，正在重连';
+    this.reconnectHint = '从后台返回，正在重连…';
+    void this.connect(true);
   }
 
   private async persistDeviceStatus(status: string): Promise<void> {
@@ -1550,10 +2875,16 @@ struct Session {
   }
 
   private async disconnect(): Promise<void> {
+    this.clipboard.stop();
+    this.connectSeq++;
+    this.releaseRemoteInput();
+    this.remoteInputFocused = false;
+    this.showKeyboard = false;
     this.intentionalDisconnect = true;
     this.reconnectInFlight = false;
     this.reconnectAttempt = 0;
     this.reconnectHint = '';
+    this.clearAutoHideTimer();
     SessionKeepAlive.setActive(false);
     try {
       if (this.videoTimer !== -1) {
@@ -1597,6 +2928,7 @@ struct Session {
         // 3 = FAILED：链路断了。已登录过且非主动断开 → 短线重连
         if (status === 3 && this.isConnected && !this.intentionalDisconnect) {
           DEBUG.note('session status=3 -> auto reconnect');
+          this.clipboard.stop();
           SessionKeepAlive.setActive(false);
           this.isConnected = false;
           this.connectionStatus = '会话中断';
@@ -1643,187 +2975,94 @@ struct Session {
     }
   }
 
-  private containScale(): number {
-    if (this.remoteW <= 0 || this.remoteH <= 0 || this.videoViewW <= 0 || this.videoViewH <= 0) {
-      return 1;
+  private get displayModeLabel(): string {
+    if (this.displayMode === DisplayMode.FIT) {
+      return '适应';
+    } else if (this.displayMode === DisplayMode.FILL) {
+      return '填充';
+    } else {
+      return '1:1';
     }
-    return Math.min(this.videoViewW / this.remoteW, this.videoViewH / this.remoteH);
+  }
+
+  private cycleDisplayMode(): void {
+    if (this.displayMode === DisplayMode.FIT) {
+      this.setDisplayMode(DisplayMode.FILL);
+    } else if (this.displayMode === DisplayMode.FILL) {
+      this.setDisplayMode(DisplayMode.ORIGINAL);
+    } else {
+      this.setDisplayMode(DisplayMode.FIT);
+    }
+  }
+
+  private setDisplayMode(mode: DisplayMode): void {
+    this.displayMode = mode;
+    VIEW.setMode(mode);
+    this.syncView();
+    DEBUG.note(`mode switched: ${mode}`);
+  }
+
+  private containScale(): number {
+    return VIEW.baseScale;
   }
 
   private zoomedW(): number {
-    return this.remoteW * this.containScale() * VIEW.scale;
+    return VIEW.renderedW;
   }
 
   private zoomedH(): number {
-    return this.remoteH * this.containScale() * VIEW.scale;
+    return VIEW.renderedH;
   }
 
   private zoomedX(): number {
-    return (this.videoViewW - this.zoomedW()) / 2 + VIEW.panX;
+    return VIEW.originX;
   }
 
   private zoomedY(): number {
-    return (this.videoViewH - this.zoomedH()) / 2 + VIEW.panY;
+    return VIEW.originY;
   }
 
   private setViewScale(scale: number): void {
-    if (scale < 1) {
-      scale = 1;
-    }
-    if (scale > 5) {
-      scale = 5;
-    }
-    VIEW.scale = scale;
-    if (VIEW.scale <= 1.01) {
-      VIEW.scale = 1;
-      VIEW.panX = 0;
-      VIEW.panY = 0;
-    } else {
-      this.constrainPan();
-    }
+    VIEW.setUserZoom(scale);
     this.syncView();
   }
 
   private resetView(): void {
-    VIEW.scale = 1;
-    VIEW.panX = 0;
-    VIEW.panY = 0;
+    VIEW.reset();
     this.syncView();
   }
 
   private syncView(): void {
-    VIEW.w = this.videoViewW;
-    VIEW.h = this.videoViewH;
-    VIEW.remoteW = this.remoteW;
-    VIEW.remoteH = this.remoteH;
+    VIEW.updateGeometry(this.videoViewW, this.videoViewH, this.remoteW, this.remoteH);
+    this.viewScale = VIEW.scale;
+    this.panX = VIEW.panX;
+    this.panY = VIEW.panY;
   }
 
   private constrainPan(): void {
-    const imgW = this.zoomedW();
-    const imgH = this.zoomedH();
-    if (imgW > this.videoViewW) {
-      const limit = (imgW - this.videoViewW) / 2;
-      if (VIEW.panX > limit) {
-        VIEW.panX = limit;
-      }
-      if (VIEW.panX < -limit) {
-        VIEW.panX = -limit;
-      }
-    } else {
-      VIEW.panX = 0;
-    }
-    if (imgH > this.videoViewH) {
-      const limit = (imgH - this.videoViewH) / 2;
-      if (VIEW.panY > limit) {
-        VIEW.panY = limit;
-      }
-      if (VIEW.panY < -limit) {
-        VIEW.panY = -limit;
-      }
-    } else {
-      VIEW.panY = 0;
-    }
+    VIEW.constrainPan();
+    VIEW.originX = (VIEW.w - VIEW.renderedW) / 2 + VIEW.panX;
+    VIEW.originY = (VIEW.h - VIEW.renderedH) / 2 + VIEW.panY;
     this.syncView();
   }
 
   private cursorScreenX(): number {
-    if (this.remoteW <= 0) {
-      return this.videoViewW / 2;
-    }
-    return this.zoomedX() + this.cursorX / this.remoteW * this.zoomedW();
+    return VIEW.remoteToScreen(this.cursorX, this.cursorY)[0];
   }
 
   private cursorScreenY(): number {
-    if (this.remoteH <= 0) {
-      return this.videoViewH / 2;
-    }
-    return this.zoomedY() + this.cursorY / this.remoteH * this.zoomedH();
+    return VIEW.remoteToScreen(this.cursorX, this.cursorY)[1];
   }
 
   private clampCursor(): void {
-    if (this.cursorX < 0) {
-      this.cursorX = 0;
-    }
-    if (this.cursorY < 0) {
-      this.cursorY = 0;
-    }
-    if (this.cursorX >= this.remoteW) {
-      this.cursorX = this.remoteW - 1;
-    }
-    if (this.cursorY >= this.remoteH) {
-      this.cursorY = this.remoteH - 1;
-    }
+    this.cursorX = VIEW.clampRemoteX(this.cursorX);
+    this.cursorY = VIEW.clampRemoteY(this.cursorY);
     TRACKPAD.cursorX = this.cursorX;
     TRACKPAD.cursorY = this.cursorY;
   }
 
-  private isOnRemoteImage(localX: number, localY: number): boolean {
-    const ox = this.zoomedX();
-    const oy = this.zoomedY();
-    const w = this.zoomedW();
-    const h = this.zoomedH();
-    return localX >= ox && localX <= ox + w && localY >= oy && localY <= oy + h;
-  }
-
-  private beginTrackpadGesture(event: GestureEvent): void {
-    TRACKPAD.ignoreGesture = true;
-    if (this.textSelectMode || !this.virtualMouse || TRACKPAD.freezeMove) {
-      mouseTrace('pan-start-ignored');
-      return;
-    }
-    TRACKPAD.ignoreGesture = false;
-    TRACKPAD.gestureStartX = TRACKPAD.cursorX;
-    TRACKPAD.gestureStartY = TRACKPAD.cursorY;
-    mouseTrace(`pan-origin ${TRACKPAD.gestureStartX},${TRACKPAD.gestureStartY} off=${event.offsetX},${event.offsetY}`);
-  }
-
-  private moveTrackpadGesture(offsetX: number, offsetY: number): void {
-    if (this.textSelectMode || TRACKPAD.ignoreGesture || TRACKPAD.freezeMove || !this.virtualMouse || !this.nativeRef || this.videoViewW <= 0) {
-      return;
-    }
-    // 触摸板灵敏度：越小越慢（约 80%）
-    const speed = 0.90;
-    const scale = this.remoteW / this.videoViewW * speed;
-    TRACKPAD.cursorX = Math.round(TRACKPAD.gestureStartX + offsetX * scale);
-    TRACKPAD.cursorY = Math.round(TRACKPAD.gestureStartY + offsetY * scale);
-    this.cursorX = TRACKPAD.cursorX;
-    this.cursorY = TRACKPAD.cursorY;
-    this.clampCursor();
-    TRACKPAD.cursorX = this.cursorX;
-    TRACKPAD.cursorY = this.cursorY;
-    if (Math.abs(offsetX) + Math.abs(offsetY) > 10) {
-      this.touchMoved = true;
-      this.clearRightClickTimer();
-    }
-    mouseTrace(`pan-move off=${offsetX.toFixed(1)},${offsetY.toFixed(1)} scale=${scale.toFixed(3)} send=${this.cursorX},${this.cursorY}`);
-    this.nativeRef.sendMouseMove(this.cursorX, this.cursorY);
-  }
-
-  private mapToRemote(localX: number, localY: number): number[] | null {
-    const w = this.zoomedW();
-    const h = this.zoomedH();
-    if (w <= 0 || h <= 0 || this.remoteW <= 0 || this.remoteH <= 0) {
-      return null;
-    }
-    if (!this.isOnRemoteImage(localX, localY)) {
-      mouseTrace(`abs-outside ${localX},${localY}`);
-      return null;
-    }
-    let x = Math.round((localX - this.zoomedX()) / w * this.remoteW);
-    let y = Math.round((localY - this.zoomedY()) / h * this.remoteH);
-    if (x < 0) {
-      x = 0;
-    }
-    if (y < 0) {
-      y = 0;
-    }
-    if (x >= this.remoteW) {
-      x = this.remoteW - 1;
-    }
-    if (y >= this.remoteH) {
-      y = this.remoteH - 1;
-    }
-    return [x, y];
+  private mapToRemote(localX: number, localY: number): [number, number] | null {
+    return VIEW.screenToRemote(localX, localY);
   }
 
   private clearRightClickTimer(): void {
@@ -1837,6 +3076,7 @@ struct Session {
     if (this.viewOnly || !this.isConnected || !this.nativeRef) {
       return;
     }
+    this.clampCursor();
     // 先同步当前光标，再发滚轮，对方会在光标位置滚动
     this.nativeRef.sendMouseMove(this.cursorX, this.cursorY);
     this.nativeRef.sendMouseWheel(deltaY);
@@ -1847,6 +3087,7 @@ struct Session {
     if (this.viewOnly || !this.isConnected || !this.nativeRef) {
       return;
     }
+    this.clampCursor();
     if (pressed) {
       if (this.rightDown) {
         return;
@@ -1883,50 +3124,15 @@ struct Session {
     if (this.remoteW <= 0 || this.remoteH <= 0 || this.videoViewW <= 0 || this.videoViewH <= 0) {
       return;
     }
-    if (VIEW.scale < 2.4) {
-      VIEW.scale = 2.4;
+    if (VIEW.userZoom < 2.4) {
+      VIEW.userZoom = 2.4;
+      VIEW.updateGeometry();
     }
-    const imgW = this.zoomedW();
-    const imgH = this.zoomedH();
-    VIEW.panX = imgW / 2 - this.cursorX / this.remoteW * imgW;
-    VIEW.panY = imgH / 2 - this.cursorY / this.remoteH * imgH;
+    const imgW = VIEW.renderedW;
+    const imgH = VIEW.renderedH;
+    VIEW.panX = imgW / 2 - (this.cursorX / this.remoteW) * imgW;
+    VIEW.panY = imgH / 2 - (this.cursorY / this.remoteH) * imgH;
     this.constrainPan();
-  }
-
-  private handleTrackpadPress(event: TouchEvent, px: number, py: number): void {
-    if (this.viewOnly || !this.isConnected) {
-      return;
-    }
-    if (event.type === TouchType.Down) {
-      this.touchMoved = false;
-      this.rightClicked = false;
-      this.touchStartX = px;
-      this.touchStartY = py;
-      this.clearRightClickTimer();
-      // 按住底部「左键」拖动时，不触发长按右键
-      if (!TRACKPAD.freezeMove && !this.leftHeld) {
-        this.longPressTimer = setTimeout(() => {
-          this.sendRightClickAtCursor();
-        }, 500);
-      }
-    } else if (event.type === TouchType.Move) {
-      if (Math.abs(px - this.touchStartX) + Math.abs(py - this.touchStartY) > 10) {
-        this.touchMoved = true;
-        this.clearRightClickTimer();
-      }
-    } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
-      this.clearRightClickTimer();
-      // 轻点屏幕 = 当前光标位置左键单击（触摸板 tap-to-click）
-      if (!this.touchMoved && !this.rightClicked && !this.leftHeld && !TRACKPAD.freezeMove &&
-        this.nativeRef && event.type === TouchType.Up) {
-        this.nativeRef.sendMouseMove(this.cursorX, this.cursorY);
-        this.nativeRef.sendMouseClick(0, true);
-        this.nativeRef.sendMouseClick(0, false);
-        mouseTrace(`tap-click ${this.cursorX},${this.cursorY}`);
-        DEBUG.note(`左键单击 ${this.cursorX},${this.cursorY}`);
-      }
-      TRACKPAD.freezeMove = false;
-    }
   }
 
   private touchPoint(event: TouchEvent): TouchObject | null {
@@ -1939,87 +3145,49 @@ struct Session {
     return null;
   }
 
-  private handleVirtualMouseTouch(event: TouchEvent): void {
-    if (!this.nativeRef) {
-      return;
-    }
-    if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
-      this.vmNeedAnchor = true;
-      return;
-    }
-    const point = this.touchPoint(event);
-    if (!point) {
-      return;
-    }
-    const fx = point.windowX;
-    const fy = point.windowY;
-    if (event.type === TouchType.Down) {
-      this.lastFingerX = fx;
-      this.lastFingerY = fy;
-      this.vmNeedAnchor = true;
-      return;
-    }
-    if (event.type !== TouchType.Move) {
-      return;
-    }
-    if (this.vmNeedAnchor) {
-      this.lastFingerX = fx;
-      this.lastFingerY = fy;
-      this.vmNeedAnchor = false;
-      return;
-    }
-    const dx = fx - this.lastFingerX;
-    const dy = fy - this.lastFingerY;
-    this.lastFingerX = fx;
-    this.lastFingerY = fy;
-    if (this.videoViewW <= 0 || this.videoViewH <= 0) {
-      return;
-    }
-    const speed = 0.90;
-    this.cursorX = Math.round(this.cursorX + dx / this.videoViewW * this.remoteW * speed);
-    this.cursorY = Math.round(this.cursorY + dy / this.videoViewH * this.remoteH * speed);
-    this.clampCursor();
-    this.nativeRef.sendMouseMove(this.cursorX, this.cursorY);
-  }
-
   private handleRemoteTouch(event: TouchEvent): void {
-    if (this.pinching || event.touches.length >= 2) {
-      if (this.longPressTimer !== -1) {
-        clearTimeout(this.longPressTimer);
-        this.longPressTimer = -1;
-      }
+    if (event.source === SourceType.Mouse) { return; }
+    if (event.type === TouchType.Cancel || this.pinching || event.touches.length >= 2) {
+      this.cancelDirectTouch();
       return;
     }
-    if (this.viewOnly || !this.isConnected || !this.nativeRef) {
+    if (!this.inputReady() || !this.nativeRef) {
       if (!this.firstTouchLogged) {
         this.firstTouchLogged = true;
         this.addLog(this.viewOnly ? '当前是只读，触摸不会发给对方' : '触摸到了，但原生还没就绪');
       }
       return;
     }
-    if (this.virtualMouse && !this.textSelectMode) {
-      return;
-    }
-    const point = event.touches.length > 0 ? event.touches[0] : event.changedTouches[0];
+    if (event.type !== TouchType.Down && !this.touchActive) { return; }
+    const point = this.touchPoint(event);
     if (!point) {
       return;
     }
     const mapped = this.mapToRemote(point.x, point.y);
-    if (!mapped) {
-      return;
-    }
-    const x = mapped[0];
-    const y = mapped[1];
-    if (!this.firstTouchLogged) {
-      this.firstTouchLogged = true;
-      this.addLog(`已发送鼠标 ${x},${y}`);
-    }
     if (event.type === TouchType.Down) {
+      if (!mapped) {
+        // Black-bar / letterbox touch: do not register
+        return;
+      }
+      this.hardwarePointer?.releaseAll();
+      this.cancelDirectTouch();
+      this.releaseFloatingButtons();
+      this.touchActive = true;
+      const x = mapped[0];
+      const y = mapped[1];
+      this.cursorX = x;
+      this.cursorY = y;
+      TRACKPAD.cursorX = x;
+      TRACKPAD.cursorY = y;
       this.touchDragging = false;
       this.touchMoved = false;
       this.rightClicked = false;
       this.touchStartX = x;
       this.touchStartY = y;
+      if (!this.firstTouchLogged) {
+        this.firstTouchLogged = true;
+        this.addLog(`已发送直接触控 ${x},${y}`);
+      }
       mouseTrace(`abs-down mapped=${x},${y} local=${point.x},${point.y}`);
       this.nativeRef.sendMouseMove(x, y);
       if (this.longPressTimer !== -1) {
@@ -2036,6 +3204,15 @@ struct Session {
         }, 480);
       }
     } else if (event.type === TouchType.Move) {
+      if (!mapped) {
+        return;
+      }
+      const x = mapped[0];
+      const y = mapped[1];
+      this.cursorX = x;
+      this.cursorY = y;
+      TRACKPAD.cursorX = x;
+      TRACKPAD.cursorY = y;
       // 选字模式：更小位移就进入拖选
       const dragThreshold = this.textSelectMode ? 4 : 8;
       if (Math.abs(x - this.touchStartX) + Math.abs(y - this.touchStartY) > dragThreshold) {
@@ -2055,15 +3232,23 @@ struct Session {
         clearTimeout(this.longPressTimer);
         this.longPressTimer = -1;
       }
-      this.nativeRef.sendMouseMove(x, y);
-      if (this.rightClicked) {
-        // already sent right click
-      } else if (this.touchDragging) {
+      if (this.touchDragging) {
+        // Drag in progress: always release left mouse button reliably
         this.nativeRef.sendMouseClick(0, false);
-      } else {
+      } else if (mapped && event.type === TouchType.Up && !this.touchMoved && !this.rightClicked) {
+        // Clean single tap inside rendered frame: send move and left click
+        const x = mapped[0];
+        const y = mapped[1];
+        this.cursorX = x;
+        this.cursorY = y;
+        TRACKPAD.cursorX = x;
+        TRACKPAD.cursorY = y;
+        this.nativeRef.sendMouseMove(x, y);
         this.nativeRef.sendMouseClick(0, true);
         this.nativeRef.sendMouseClick(0, false);
+        mouseTrace(`abs-tap-click mapped=${x},${y}`);
       }
+      this.touchActive = false;
       this.touchDragging = false;
       this.touchMoved = false;
       this.rightClicked = false;
@@ -2073,13 +3258,16 @@ struct Session {
   private toggleTextSelectMode(): void {
     this.textSelectMode = !this.textSelectMode;
     if (this.textSelectMode) {
-      this.showKeyboard = false;
+      this.chromeVisible = true;
+      this.clearAutoHideTimer();
       DEBUG.note('选字模式：拖选文字，用底部快捷条复制');
+    } else {
+      this.resetAutoHideTimer();
     }
   }
 
   private sendCtrlLetter(letter: string): void {
-    if (!this.nativeRef || this.viewOnly || letter.length === 0) {
+    if (!this.isConnected || !this.nativeRef || this.viewOnly || letter.length === 0) {
       return;
     }
     const ch = letter.toLowerCase().charCodeAt(0);
@@ -2087,4 +3275,5 @@ struct Session {
     this.nativeRef.sendChord(ch, 4);
     DEBUG.note(`chord Ctrl+${letter}`);
   }
+
 }

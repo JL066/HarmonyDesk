@@ -15,6 +15,10 @@
     {
       "name": "internet_permission_reason",
       "value": "需要网络权限以连接到远程桌面"
+    },
+    {
+      "name": "read_pasteboard_permission_reason",
+      "value": "连接期间自动同步本机与远端的文本剪贴板，可在会话中关闭"
     }
   ]
 }

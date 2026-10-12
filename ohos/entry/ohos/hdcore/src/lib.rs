@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::raw::{c_char, c_int};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -58,10 +58,29 @@ static TEST_DELAY_ECHOED: AtomicI32 = AtomicI32::new(0);
 static LAST_TEST_DELAY_CLEAR_MS: AtomicI64 = AtomicI64::new(0);
 static OUTGOING: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 static LAST_MOUSE: Mutex<(i32, i32)> = Mutex::new((0, 0));
+// Exact held physical modifiers from HarmonyOS. MouseEvent carries a modifier
+// list too, so Ctrl/Shift/Alt/Meta remain effective during pointer input.
+static HARDWARE_MODIFIER_MASK: AtomicU32 = AtomicU32::new(0);
 /// Serialize all TCP writes. Session thread (TestDelay echo) and writer thread
 /// (mouse/keys/options) previously wrote concurrently and corrupted framing,
 /// so the host never cleared last_test_delay → response_delayed → FPS=2.
 static STREAM_WRITE: Mutex<()> = Mutex::new(());
+
+// ===== Stage 3A: inbound clipboard text (Windows -> HarmonyDesk) =====
+//
+// Stores the latest valid plain-text remote clipboard plus a monotonically
+// increasing sequence number. The slot is overwritten only when a valid
+// `Clipboard{format=Text}` payload is accepted. Malformed, non-text, or
+// oversized messages are rejected without touching the slot, so callers
+// can use seq as a "new clipboard available" edge trigger.
+//
+// The text is preserved byte-for-byte (no trim, no line-ending conversion,
+// no charset coercion). UTF-8 validation is the only mutation point.
+const CLIPBOARD_MAX_OUTPUT: usize = 8 * 1024 * 1024; // 8 MiB plain-text cap
+static CLIPBOARD_TEXT: Mutex<String> = Mutex::new(String::new());
+static CLIPBOARD_SEQ: AtomicU64 = AtomicU64::new(0);
+// Host only sends permission overrides; clipboard is allowed by default.
+static CLIPBOARD_ALLOWED: AtomicBool = AtomicBool::new(true);
 
 const TEST_DELAY_CLEAR_MS: i64 = 250;
 
@@ -364,9 +383,63 @@ fn build_mouse_event(mask: i32, x: i32, y: i32) -> Vec<u8> {
     encode_varint_field(&mut inner, 1, mask as u64);
     encode_sint32_field(&mut inner, 2, x);
     encode_sint32_field(&mut inner, 3, y);
+    for modifier in mouse_modifiers(HARDWARE_MODIFIER_MASK.load(Ordering::SeqCst)) {
+        encode_varint_field(&mut inner, 4, modifier as u64);
+    }
     let mut msg = Vec::new();
     encode_bytes(&mut msg, 10, &inner);
     msg
+}
+
+fn hardware_modifier_bit(code: u32) -> u32 {
+    match code {
+        4 => 1 << 0,  // Control
+        74 => 1 << 1, // Right Control
+        29 => 1 << 2, // Shift
+        73 => 1 << 3, // Right Shift
+        1 => 1 << 4,  // Alt
+        75 => 1 << 5, // Right Alt
+        23 => 1 << 6, // Meta
+        64 => 1 << 7, // Right Meta/Windows
+        _ => 0,
+    }
+}
+
+fn hardware_modifier_mask(modifiers: &[u32]) -> u32 {
+    modifiers.iter().fold(0, |mask, code| mask | hardware_modifier_bit(*code))
+}
+
+fn mouse_modifiers(mask: u32) -> Vec<u32> {
+    let mut modifiers = Vec::with_capacity(4);
+    if mask & ((1 << 0) | (1 << 1)) != 0 {
+        modifiers.push(4); // Control
+    }
+    if mask & ((1 << 2) | (1 << 3)) != 0 {
+        modifiers.push(29); // Shift
+    }
+    if mask & ((1 << 4) | (1 << 5)) != 0 {
+        modifiers.push(1); // Alt
+    }
+    if mask & ((1 << 6) | (1 << 7)) != 0 {
+        modifiers.push(23); // Meta
+    }
+    modifiers
+}
+
+fn exact_hardware_modifiers(mask: u32) -> Vec<u32> {
+    let mut modifiers = Vec::with_capacity(8);
+    for code in [4u32, 74, 29, 73, 1, 75, 23, 64] {
+        if mask & hardware_modifier_bit(code) != 0 {
+            modifiers.push(code);
+        }
+    }
+    modifiers
+}
+
+fn restore_hardware_modifiers(mask: u32) {
+    for code in exact_hardware_modifiers(mask) {
+        enqueue_msg(build_key_control(code, true, false));
+    }
 }
 
 fn build_key_chr(chr: u32, down: bool, press: bool) -> Vec<u8> {
@@ -426,10 +499,186 @@ fn build_key_control_mod(code: u32, modifiers: &[u32], down: bool, press: bool) 
 
 /// 松开 Ctrl/Shift/Alt/Meta，避免修饰键卡住
 fn release_modifiers() {
-    for code in [4u32, 29, 1, 23] {
-        // Control=4, Shift=29, Alt=1, Meta=23
+    for code in [4u32, 74, 29, 73, 1, 75, 23, 64] {
+        // Release left and right Control/Shift/Alt/Meta before text macros.
         enqueue_msg(build_key_control(code, false, false));
     }
+}
+
+/// Build plain-text Clipboard protobuf (RustDesk top-level Message field 16).
+/// Inner Clipboard: only field 2 = content (raw UTF-8 bytes).
+/// compress/format/width/height/special_name are omitted so peer applies
+/// RustDesk defaults: compress=false, ClipboardFormat::Text=0. No zstd,
+/// no trimming, no line-ending conversion, no keyboard emulation.
+fn build_clipboard_text(text: &str) -> Vec<u8> {
+    let mut inner = Vec::new();
+    encode_bytes(&mut inner, 2, text.as_bytes());
+    let mut outer = Vec::new();
+    encode_bytes(&mut outer, 16, &inner);
+    outer
+}
+
+/// Parse a RustDesk `Clipboard` (top-level Message field 16) inner payload and
+/// return the UTF-8 text if the message represents a valid plain-text
+/// clipboard update. Returns `Err` for any malformed / non-text / oversized
+/// message so the caller can leave the slot untouched.
+///
+/// Inner fields handled:
+///   1 compress  (bool, varint) — when true, `content` is zstd-compressed
+///   2 content   (bytes)        — raw UTF-8 (compress=false) or zstd frame
+///   5 format    (varint enum)  — 0=Text (default), non-zero is rejected
+/// width / height / special_name are intentionally ignored.
+///
+/// Output is bounded to `CLIPBOARD_MAX_OUTPUT` (8 MiB) to defeat decompression
+/// bombs. UTF-8 decoding preserves the original code points exactly — no
+/// trim, no line-ending conversion, no charset coercion.
+fn parse_clipboard_text(inner: &[u8]) -> Result<String, String> {
+    let mut index = 0;
+    let mut compress = false;
+    let mut content: Option<&[u8]> = None;
+    let mut format: u64 = 0; // protobuf default = Text(0)
+    while let Some((field, value)) = next_field(inner, &mut index) {
+        match (field, value) {
+            (1, ProtoValue::Varint(v)) => compress = v != 0,
+            (2, ProtoValue::Bytes(b)) => content = Some(b),
+            (5, ProtoValue::Varint(v)) => format = v,
+            _ => {} // width / height / special_name — ignored
+        }
+    }
+    if format != 0 {
+        return Err(format!("non-text format={format}"));
+    }
+    let raw = if compress {
+        let compressed = content.unwrap_or(&[]);
+        // Empty zstd frame is still a valid (empty) decompression result.
+        let mut decoder = ruzstd::decoding::StreamingDecoder::new(compressed)
+            .map_err(|e| format!("zstd header: {e:?}"))?;
+        let mut out: Vec<u8> = Vec::new();
+        out.try_reserve_exact(1024.min(CLIPBOARD_MAX_OUTPUT))
+            .map_err(|e| format!("zstd oom: {e}"))?;
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = match std::io::Read::read(&mut decoder, &mut chunk) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => return Err(format!("zstd read: {e}")),
+            };
+            if out.len() + n > CLIPBOARD_MAX_OUTPUT {
+                return Err(format!(
+                    "zstd output exceeds {CLIPBOARD_MAX_OUTPUT} bytes"
+                ));
+            }
+            out.try_reserve(n)
+                .map_err(|e| format!("zstd oom: {e}"))?;
+            out.extend_from_slice(&chunk[..n]);
+        }
+        out
+    } else {
+        let bytes = content.unwrap_or(&[]);
+        if bytes.len() > CLIPBOARD_MAX_OUTPUT {
+            return Err(format!(
+                "clipboard content exceeds {CLIPBOARD_MAX_OUTPUT} bytes"
+            ));
+        }
+        bytes.to_vec()
+    };
+    match std::str::from_utf8(&raw) {
+        Ok(s) => Ok(s.to_string()),
+        Err(e) => Err(format!("utf8: {e}")),
+    }
+}
+
+/// Accept a parsed clipboard text: replace the slot and increment the seq.
+/// The seq is monotonically increasing and only bumps on a valid Text
+/// clipboard message. Callers snapshot the seq, trigger a UI action, then
+/// poll until the seq changes to detect a fresh remote clipboard.
+///
+/// Generation-integrity rule: the sequence number must reflect the number
+/// of *observable* slot updates, not the number of attempts. If the slot
+/// mutex is poisoned or the lock is otherwise unobtainable we MUST NOT
+/// bump the seq, otherwise `GetRemoteClipboardText` will hand JS back the
+/// new seq while the C++ wrapper re-queries and finds the *previous*
+/// payload, so the UI would conclude a new clipboard is available when
+/// nothing actually changed. We log/reject and bail out in that case.
+fn accept_remote_clipboard(text: String) {
+    if !CLIPBOARD_ALLOWED.load(Ordering::SeqCst) {
+        return;
+    }
+    let len = text.len();
+    let chars = text.chars().count();
+    // Generation-integrity rule: the sequence number must be bumped *while
+    // the slot mutex is still held* so the new payload and the new seq
+    // become visible to readers atomically. Any reader that acquires the
+    // lock after this function returns will observe the new text together
+    // with the new generation, never the new text under the old seq. If
+    // the lock is unavailable (poisoned mutex) we MUST NOT bump the seq:
+    // a stale seq would let `GetRemoteClipboardText` hand JS back a fresh
+    // generation number while the C++ wrapper re-queries and finds the
+    // *previous* payload, so the UI would conclude a new clipboard is
+    // available when nothing actually changed. We log/reject and bail
+    // out in that case.
+    let seq = match CLIPBOARD_TEXT.lock() {
+        Ok(mut slot) => {
+            *slot = text;
+            CLIPBOARD_SEQ.fetch_add(1, Ordering::SeqCst) + 1
+        }
+        Err(poisoned) => {
+            // A panic in another thread poisoned the mutex. Do NOT advance
+            // the generation — recover the inner value to keep subsequent
+            // locks cheap, then bail out. Subsequent slot reads from JS
+            // will see the stale value and `GetRemoteClipboardSeq` /
+            // `GetRemoteClipboardText` will continue to agree.
+            drop(poisoned.into_inner());
+            append_log(&format!(
+                "clipboard text slot poisoned; rejecting (bytes={len} chars={chars})"
+            ));
+            return;
+        }
+    };
+    append_log(&format!(
+        "clipboard text seq={seq} bytes={len} chars={chars}"
+    ));
+}
+
+/// Parse a RustDesk `MultiClipboards` (top-level Message field 28) inner
+/// payload and return the first valid plain-text entry, if any. Each
+/// `clipboards` (field 1) entry is itself a `Clipboard` protobuf message
+/// that we delegate to `parse_clipboard_text` so compress / format /
+/// UTF-8 / 8MiB safety and exactness stay identical to the field-16 path.
+///
+/// Windows controlled side (RustDesk >= 1.3.3 introduced multi-clipboard)
+/// wraps every clipboard update in a single MultiClipboards, so
+/// `CLIPBOARD_SEQ` would never advance via the field-16 branch and Text
+/// copies from Windows to this pad would time out. Non-text formats
+/// (Bitmap / File / ...) and malformed or oversized individual Clipboard
+/// entries are silently skipped so a leading non-text entry does not
+/// prevent the helper from finding a Text entry that follows. Returns
+/// `None` when no entry yields a valid Text payload — the caller leaves
+/// the slot untouched and does not bump the seq.
+///
+/// Intentionally narrow: only `ClipboardFormat::Text` (field 5 == 0) is
+/// surfaced. HTML / RTF / image / file / special-format entries are
+/// ignored; HTML/RTF/images/files/special support is out of scope and
+/// would change the inbound contract.
+fn parse_multi_clipboards_text(inner: &[u8]) -> Option<String> {
+    let mut index = 0;
+    while let Some((field, value)) = next_field(inner, &mut index) {
+        // MultiClipboards.clipboards = repeated field 1 of inner Clipboard
+        // messages. Skip unknown fields (forward-compat) and any field-1
+        // whose wire type is not length-delimited. Skip entries whose own
+        // parse fails — non-text format, bad UTF-8, oversized zstd, ... —
+        // and keep scanning so a later Text entry still wins.
+        if field != 1 {
+            continue;
+        }
+        let ProtoValue::Bytes(entry) = value else {
+            continue;
+        };
+        if let Ok(text) = parse_clipboard_text(entry) {
+            return Some(text);
+        }
+    }
+    None
 }
 
 fn read_varint(data: &[u8], index: &mut usize) -> Option<u64> {
@@ -918,7 +1167,7 @@ fn build_option_message() -> Vec<u8> {
         encode_varint_field(&mut option, 6, (quality as u64) << 8);
     }
     encode_varint_field(&mut option, 7, 2); // disable_audio = Yes
-    encode_varint_field(&mut option, 8, 2); // disable_clipboard = Yes
+    encode_varint_field(&mut option, 8, 1); // disable_clipboard = No (Stage 2A: enable text clipboard transport)
     encode_bytes(&mut option, 10, &decoding);
     encode_varint_field(&mut option, 11, fps as u64);
     encode_varint_field(&mut option, 12, 1); // disable_keyboard = No
@@ -1223,6 +1472,9 @@ fn handle_misc(inner: &[u8]) {
                         _ => {}
                     }
                 }
+                if kind == 2 { // PermissionInfo.Permission.Clipboard
+                    CLIPBOARD_ALLOWED.store(enabled != 0, Ordering::SeqCst);
+                }
                 append_log(&format!("permission kind={kind} enabled={enabled}"));
             }
             (9, ProtoValue::Bytes(reason)) => {
@@ -1305,13 +1557,32 @@ fn handle_session_message(payload: &[u8]) -> Result<Option<Vec<u8>>, String> {
             append_log(&format!("cursor data bytes={}", inner.len()));
         }
         (16, ProtoValue::Bytes(inner)) => {
-            append_log(&format!("clipboard bytes={}", inner.len()));
+            // Stage 3A: parse + cache plain-text clipboard. compress=false uses
+            // raw UTF-8; compress=true zstd-decompresses (bounded) before UTF-8
+            // decode. Malformed / non-text / oversized messages do not bump the
+            // sequence number or touch the cached text.
+            match parse_clipboard_text(inner) {
+                Ok(text) => accept_remote_clipboard(text),
+                Err(e) => append_log(&format!("clipboard reject: {e}")),
+            }
         }
         (20, ProtoValue::Bytes(inner)) => {
             append_log(&format!("cliprdr bytes={}", inner.len()));
         }
         (28, ProtoValue::Bytes(inner)) => {
-            append_log(&format!("multi-clipboard bytes={}", inner.len()));
+            // Stage 3A: peer (RustDesk >= 1.3.3 controlled side, e.g.
+            // Windows RustDesk) dispatches clipboard updates via
+            // MultiClipboards rather than the legacy field-16 Clipboard.
+            // Delegate each repeated `clipboards` (field 1) entry to the
+            // same Text safety logic; first valid Text is cached and
+            // bumps the seq. Non-text / malformed / oversized entries
+            // are skipped silently. If no Text entry exists, leave the
+            // slot and seq untouched (no false "new clipboard" edges).
+            if let Some(text) = parse_multi_clipboards_text(inner) {
+                accept_remote_clipboard(text);
+            } else {
+                append_log("multi-clipboard: no text entry");
+            }
         }
         other => {
             if other.0 != 8 && other.0 != 25 && other.0 != 13 && other.0 != 11 && other.0 != 14 {
@@ -1766,6 +2037,7 @@ fn lookup_peer(
 #[no_mangle]
 pub extern "C" fn hd_init() -> c_int {
     append_log("hdcore init ok");
+    HARDWARE_MODIFIER_MASK.store(0, Ordering::SeqCst);
     STATUS.store(STATUS_IDLE, Ordering::SeqCst);
     0
 }
@@ -1826,6 +2098,7 @@ pub extern "C" fn hd_connect_start(desk_id: *const c_char, password: *const c_ch
     }
 
     CONNECT_GEN.fetch_add(1, Ordering::SeqCst);
+    HARDWARE_MODIFIER_MASK.store(0, Ordering::SeqCst);
     let gen = CONNECT_GEN.load(Ordering::SeqCst);
     let direct = is_direct_ip_peer(&desk);
     DIRECT_IP_SESSION.store(direct, Ordering::SeqCst);
@@ -1859,6 +2132,15 @@ pub extern "C" fn hd_connect_start(desk_id: *const c_char, password: *const c_ch
     if let Ok(mut queue) = OUTGOING.lock() {
         queue.clear();
     }
+    // Stage 3A: clear remote clipboard slot so a stale value from a
+    // previous session cannot be reported by a new session that has not
+    // yet received a clipboard update. Sequence counter is also reset
+    // so the new session's first accepted clipboard is seq=1.
+    if let Ok(mut slot) = CLIPBOARD_TEXT.lock() {
+        slot.clear();
+    }
+    CLIPBOARD_SEQ.store(0, Ordering::SeqCst);
+    CLIPBOARD_ALLOWED.store(true, Ordering::SeqCst);
     STATUS.store(STATUS_CONNECTING, Ordering::SeqCst);
     set_error("");
     if is_direct_ip_peer(&desk) {
@@ -1958,6 +2240,7 @@ pub extern "C" fn hd_copy_check_result(buf: *mut c_char, len: c_int) -> c_int {
 #[no_mangle]
 pub extern "C" fn hd_disconnect() {
     CONNECT_GEN.fetch_add(1, Ordering::SeqCst);
+    HARDWARE_MODIFIER_MASK.store(0, Ordering::SeqCst);
     RUNNING.store(false, Ordering::SeqCst);
     DIRECT_IP_SESSION.store(false, Ordering::SeqCst);
     HD_PROFILE.store(false, Ordering::SeqCst);
@@ -1986,6 +2269,69 @@ pub extern "C" fn hd_copy_logs(buf: *mut c_char, len: c_int) -> c_int {
 pub extern "C" fn hd_copy_error(buf: *mut c_char, len: c_int) -> c_int {
     let err = ERROR.lock().map(|s| s.clone()).unwrap_or_default();
     copy_to_buf(&err, buf, len)
+}
+
+/// Stage 3A: monotonic generation counter for the remote clipboard slot.
+/// The value increases by exactly 1 for every accepted plain-text
+/// clipboard update. UI snapshots this before triggering Ctrl+C and
+/// waits for a new value to detect a fresh remote clipboard.
+#[no_mangle]
+pub extern "C" fn hd_clipboard_seq() -> u64 {
+    CLIPBOARD_SEQ.load(Ordering::SeqCst)
+}
+
+/// Stage 3A: read the latest remote clipboard text. This is a combined
+/// size-query + exact-copy API used by `GetRemoteClipboardText` to fetch
+/// payloads up to the full accepted `CLIPBOARD_MAX_OUTPUT` (8 MiB) without
+/// ever truncating a UTF-8 code point.
+///
+/// Calling convention (return value is always a `c_int` byte count of the
+/// UTF-8 payload, never negative; required size fits in `c_int` because
+/// the in-process cap is 8 MiB):
+///   * `buf == null || len <= 0`   → size query: returns the number of
+///     bytes the caller must provide, **does not touch `buf`**. Use this
+///     to discover the required buffer size.
+///   * `len > 0` and `len - 1 < required` → buffer too small: returns the
+///     required byte count **without writing to `buf`**. The caller must
+///     grow its buffer and call again. (This is what the C++ wrapper does
+///     before allocating, so a too-small buffer is not a failure.)
+///   * `len > 0` and `len - 1 >= required` → exact copy: writes exactly
+///     `required` UTF-8 bytes plus a trailing NUL into `buf`, then returns
+///     `required`. The bytes are the cached payload verbatim; no trim, no
+///     line-ending conversion, no charset coercion.
+///
+/// On a poisoned/locked-unsuccessfully slot the function returns 0
+/// without touching `buf`. Never panics, never partial-copies. The C++
+/// wrapper interprets 0 as "no clipboard" / "inconsistent state" and
+/// surfaces an empty string in that case.
+#[no_mangle]
+pub extern "C" fn hd_copy_clipboard_text(buf: *mut c_char, len: c_int) -> c_int {
+    // Size query path: no buffer provided.
+    if buf.is_null() || len <= 0 {
+        let text = match CLIPBOARD_TEXT.lock() {
+            Ok(s) => s.clone(),
+            Err(_) => return 0,
+        };
+        return text.len() as c_int;
+    }
+    let text = match CLIPBOARD_TEXT.lock() {
+        Ok(s) => s.clone(),
+        Err(_) => return 0,
+    };
+    let bytes = text.as_bytes();
+    let required = bytes.len();
+    // Caller's buffer must hold `required` bytes plus a NUL terminator.
+    // If it does not, refuse to write — return the required size so the
+    // caller can re-allocate. This is what guarantees no UTF-8 code
+    // point can be split and no byte is silently dropped.
+    if (len as usize) <= required {
+        return required as c_int;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, required);
+        *buf.add(required) = 0;
+    }
+    required as c_int
 }
 
 #[no_mangle]
@@ -2121,13 +2467,60 @@ pub extern "C" fn hd_send_control(code: c_int, down: c_int, press: c_int) {
         return;
     }
     let key = code as u32;
+    let modifiers = exact_hardware_modifiers(HARDWARE_MODIFIER_MASK.load(Ordering::SeqCst));
     if press != 0 {
         // 完整点按：down + up（对方服务端看的是 down，不是 press）
-        enqueue_msg(build_key_control(key, true, false));
-        enqueue_msg(build_key_control(key, false, false));
+        enqueue_msg(build_key_control_mod(key, &modifiers, true, false));
+        enqueue_msg(build_key_control_mod(key, &modifiers, false, false));
     } else {
-        enqueue_msg(build_key_control(key, down != 0, false));
+        enqueue_msg(build_key_control_mod(key, &modifiers, down != 0, false));
     }
+}
+
+/// Send one physical key transition using RustDesk ControlKey modifiers.
+/// `kind` is 1 for a character code point and 2 for a ControlKey value.
+/// `modifiers` contains numeric ControlKey values from message.proto.
+#[no_mangle]
+pub extern "C" fn hd_send_hardware_key(
+    kind: c_int,
+    code: c_int,
+    down: c_int,
+    modifiers: *const c_int,
+    modifiers_len: c_int,
+) {
+    if code <= 0 || (kind != 1 && kind != 2) {
+        return;
+    }
+    if kind == 1 {
+        let value = code as u32;
+        if value > 0x10FFFF || (0xD800..=0xDFFF).contains(&value) {
+            return;
+        }
+    }
+
+    let count = modifiers_len.clamp(0, 8) as usize;
+    let values: &[c_int] = if modifiers.is_null() || count == 0 {
+        &[]
+    } else {
+        // `count` is capped above and the pointer comes from the in-process NAPI wrapper.
+        unsafe { std::slice::from_raw_parts(modifiers, count) }
+    };
+    let mut control_modifiers = Vec::with_capacity(values.len());
+    for value in values {
+        let value = *value as u32;
+        if matches!(value, 1 | 3 | 4 | 23 | 29 | 63 | 64 | 73 | 74 | 75)
+            && !control_modifiers.contains(&value)
+        {
+            control_modifiers.push(value);
+        }
+    }
+    HARDWARE_MODIFIER_MASK.store(hardware_modifier_mask(&control_modifiers), Ordering::SeqCst);
+    let packet = if kind == 1 {
+        build_key_chr_mod(code as u32, &control_modifiers, down != 0, false)
+    } else {
+        build_key_control_mod(code as u32, &control_modifiers, down != 0, false)
+    };
+    enqueue_msg(packet);
 }
 
 /// Send Ctrl/Alt/Shift/Meta + key chord.
@@ -2141,8 +2534,12 @@ pub extern "C" fn hd_send_chord(chr: c_int, modifier: c_int) {
     if chr <= 0 || modifier <= 0 {
         return;
     }
+    let hardware_modifiers = HARDWARE_MODIFIER_MASK.load(Ordering::SeqCst);
     let mod_code = modifier as u32;
     let ch = chr as u32;
+    // Keep a physically held modifier from leaking into this UI macro, then
+    // restore its exact left/right state after the synthetic chord completes.
+    release_modifiers();
     enqueue_msg(build_key_control(mod_code, true, false));
     if ch >= 1000 {
         let key = ch - 1000;
@@ -2159,6 +2556,7 @@ pub extern "C" fn hd_send_chord(chr: c_int, modifier: c_int) {
     enqueue_msg(build_key_control(mod_code, false, false));
     // 再松一次，防止对方修饰键卡住
     enqueue_msg(build_key_control(mod_code, false, false));
+    restore_hardware_modifiers(hardware_modifiers);
     append_log(&format!("chord mod={mod_code} key={ch}"));
 }
 
@@ -2179,7 +2577,8 @@ pub extern "C" fn hd_send_text(text: *const c_char) {
     if text.is_empty() {
         return;
     }
-    // 先松开修饰键（中英切换后 Ctrl 常会卡住，密码框就收不到字）
+    let hardware_modifiers = HARDWARE_MODIFIER_MASK.load(Ordering::SeqCst);
+    // Suspend held modifiers around text (a common IME/password fallback), then restore them.
     release_modifiers();
     // Windows 密码框：逐字 Legacy chr(down)，比整段 seq 稳
     for ch in text.chars() {
@@ -2199,5 +2598,640 @@ pub extern "C" fn hd_send_text(text: *const c_char) {
             }
         }
     }
+    restore_hardware_modifiers(hardware_modifiers);
     append_log(&format!("send text len={} legacy-chr", text.chars().count()));
+}
+
+#[no_mangle]
+pub extern "C" fn hd_clipboard_allowed() -> c_int {
+    CLIPBOARD_ALLOWED.load(Ordering::SeqCst) as c_int
+}
+
+/// Outbound plain-text clipboard. Enqueues exactly one RustDesk Message
+/// (field 16 = Clipboard{content = raw UTF-8 bytes}) on OUTGOING.
+/// Return: 0 = enqueued, 1 = empty input (no-op), -1 = internal error, -2 = denied.
+/// Does NOT touch the key/mouse path — no keyboard emulation fallback.
+#[no_mangle]
+pub extern "C" fn hd_send_clipboard_text(text: *const c_char) -> c_int {
+    let text = cstr_to_string(text);
+    if text.is_empty() {
+        return 1;
+    }
+    if !CLIPBOARD_ALLOWED.load(Ordering::SeqCst) {
+        return -2;
+    }
+    let payload = build_clipboard_text(&text);
+    if let Ok(mut queue) = OUTGOING.lock() {
+        queue.push(frame_message(&payload));
+    } else {
+        append_log("clipboard text: OUTGOING lock failed");
+        return -1;
+    }
+    append_log(&format!(
+        "clipboard text bytes={} chars={}",
+        text.len(),
+        text.chars().count()
+    ));
+    0
+}
+
+// ===== Stage 3A unit tests =====
+//
+// Narrow unit tests for `parse_clipboard_text` + the FFI retrieval surface
+// (`hd_copy_clipboard_text`) covering:
+//   - uncompressed text exactness (incl. tricky Unicode / whitespace)
+//   - compressed text exactness via ruzstd's own encoder (no external fixtures)
+//   - non-text format is rejected
+//   - malformed UTF-8 is rejected
+//   - bogus zstd bytes do not panic
+//   - real compressed payload that decompresses to >8 MiB is rejected
+//     (decompression bomb guard) and does not bump the seq
+//   - FFI retrieval of a >1 MiB multi-byte payload returns the exact
+//     UTF-8 bytes via the size-query + exact-copy path with no truncation
+//
+// The tests reset `CLIPBOARD_TEXT` and read the seq counter to verify that
+// the parser does not bump the generation for rejected inputs.
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    // Test-only guard: tests mutate shared static state. cargo test runs
+    // tests in parallel by default, so we serialize them and recover from
+    // any poisoning left behind by a failed assertion.
+    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn lock_test<'a>() -> std::sync::MutexGuard<'a, ()> {
+        match TEST_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    fn reset_slot() {
+        if let Ok(mut s) = CLIPBOARD_TEXT.lock() {
+            s.clear();
+        } else if let Err(p) = CLIPBOARD_TEXT.lock() {
+            let mut s = p.into_inner();
+            s.clear();
+        }
+        CLIPBOARD_SEQ.store(0, Ordering::SeqCst);
+        CLIPBOARD_ALLOWED.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn clipboard_permission_gates_both_directions_and_can_resume() {
+        let _guard = lock_test();
+        reset_slot();
+        OUTGOING.lock().unwrap().clear();
+        assert_eq!(hd_clipboard_allowed(), 1);
+        let mut permission = Vec::new();
+        encode_varint_field(&mut permission, 1, 2);
+        let mut misc = Vec::new();
+        encode_bytes(&mut misc, 6, &permission); // omitted enabled = false
+        handle_misc(&misc);
+        assert_eq!(hd_clipboard_allowed(), 0);
+        let legacy = build_clipboard_text("blocked");
+        handle_session_message(&legacy).unwrap();
+        let mut multi_inner = Vec::new();
+        encode_bytes(&mut multi_inner, 1, &build_inner(false, b"blocked", 0));
+        let mut multi = Vec::new();
+        encode_bytes(&mut multi, 28, &multi_inner);
+        handle_session_message(&multi).unwrap();
+        assert_eq!(hd_clipboard_seq(), 0);
+        let text = std::ffi::CString::new("local").unwrap();
+        assert_eq!(hd_send_clipboard_text(text.as_ptr()), -2);
+        assert!(OUTGOING.lock().unwrap().is_empty());
+        encode_varint_field(&mut permission, 2, 1);
+        misc.clear();
+        encode_bytes(&mut misc, 6, &permission);
+        handle_misc(&misc);
+        assert_eq!(hd_clipboard_allowed(), 1);
+        accept_remote_clipboard("accepted".to_string());
+        assert_eq!(hd_clipboard_seq(), 1);
+        assert_eq!(hd_send_clipboard_text(text.as_ptr()), 0);
+        OUTGOING.lock().unwrap().clear();
+        reset_slot();
+    }
+
+    fn unframe_message(frame: &[u8]) -> &[u8] {
+        let kind = frame[0] & 3;
+        let (header, encoded_len) = match kind {
+            0 => (1usize, frame[0] as usize >> 2),
+            1 => {
+                let value = u16::from_le_bytes([frame[0], frame[1]]) as usize;
+                (2, value >> 2)
+            }
+            2 => {
+                let value = frame[0] as usize | ((frame[1] as usize) << 8) | ((frame[2] as usize) << 16);
+                (3, value >> 2)
+            }
+            _ => panic!("unexpected frame header"),
+        };
+        &frame[header..header + encoded_len]
+    }
+
+    fn key_event_fields(frame: &[u8]) -> (Option<u32>, Option<u32>, bool, Vec<u32>) {
+        let payload = unframe_message(frame);
+        let mut outer_index = 0;
+        while let Some((field, value)) = next_field(payload, &mut outer_index) {
+            if field != 15 {
+                continue;
+            }
+            let ProtoValue::Bytes(event) = value else { continue };
+            let mut control = None;
+            let mut chr = None;
+            let mut down = false;
+            let mut modifiers = Vec::new();
+            let mut index = 0;
+            while let Some((field, value)) = next_field(event, &mut index) {
+                match (field, value) {
+                    (1, ProtoValue::Varint(value)) => down = value != 0,
+                    (3, ProtoValue::Varint(value)) => control = Some(value as u32),
+                    (4, ProtoValue::Varint(value)) => chr = Some(value as u32),
+                    (8, ProtoValue::Varint(value)) => modifiers.push(value as u32),
+                    _ => {}
+                }
+            }
+            return (control, chr, down, modifiers);
+        }
+        panic!("missing KeyEvent payload");
+    }
+
+    fn mouse_modifiers(payload: &[u8]) -> Vec<u32> {
+        let mut outer_index = 0;
+        while let Some((field, value)) = next_field(payload, &mut outer_index) {
+            if field != 10 {
+                continue;
+            }
+            let ProtoValue::Bytes(mouse) = value else { continue };
+            let mut modifiers = Vec::new();
+            let mut index = 0;
+            while let Some((field, value)) = next_field(mouse, &mut index) {
+                if field == 4 {
+                    if let ProtoValue::Varint(value) = value {
+                        modifiers.push(value as u32);
+                    }
+                }
+            }
+            return modifiers;
+        }
+        panic!("missing MouseEvent payload");
+    }
+
+    #[test]
+    fn physical_modifiers_are_carried_by_keys_and_mouse_and_restored_after_macros() {
+        let _guard = lock_test();
+        let mut queue = OUTGOING.lock().unwrap();
+        queue.clear();
+        HARDWARE_MODIFIER_MASK.store(0, Ordering::SeqCst);
+        drop(queue);
+
+        let active = [4 as c_int, 29 as c_int, 63 as c_int]; // Control + Shift + NumLock
+        hd_send_hardware_key(1, 'c' as c_int, 1, active.as_ptr(), active.len() as c_int);
+        let key_packet = OUTGOING.lock().unwrap()[0].clone();
+        assert_eq!(key_event_fields(&key_packet), (None, Some('c' as u32), true, vec![4, 29, 63]));
+        let mouse_packet = build_mouse_event(1, 10, 20);
+        assert_eq!(mouse_modifiers(&mouse_packet), vec![4, 29]);
+
+        // Keep a physical Shift held while helper text and chord operations
+        // temporarily release modifiers. Each macro must re-press it last.
+        let shift = [29 as c_int];
+        hd_send_hardware_key(2, 29, 1, shift.as_ptr(), shift.len() as c_int);
+        OUTGOING.lock().unwrap().clear();
+        // IME navigation callbacks must preserve held Shift for remote selection.
+        hd_send_control(22, 1, 1);
+        let controls = OUTGOING.lock().unwrap().clone();
+        assert_eq!(key_event_fields(&controls[0]), (Some(22), None, true, vec![29]));
+        assert_eq!(key_event_fields(&controls[1]), (Some(22), None, false, vec![29]));
+        OUTGOING.lock().unwrap().clear();
+        let text = std::ffi::CString::new("x").unwrap();
+        hd_send_text(text.as_ptr());
+        let text_packets = OUTGOING.lock().unwrap().clone();
+        let last_text_key = key_event_fields(text_packets.last().unwrap());
+        assert_eq!(last_text_key, (Some(29), None, true, vec![]));
+        assert!(text_packets.iter().any(|packet| key_event_fields(packet).1 == Some('x' as u32)));
+        let text_shift_up = text_packets.iter().position(|packet| {
+            key_event_fields(packet) == (Some(29), None, false, vec![])
+        }).expect("text macro releases physical Shift first");
+        let text_press = text_packets.iter().position(|packet| {
+            key_event_fields(packet) == (None, Some('x' as u32), true, vec![])
+        }).expect("text macro emits character");
+        assert!(text_shift_up < text_press);
+        assert_eq!(mouse_modifiers(&build_mouse_event(1, 10, 20)), vec![29]);
+
+        OUTGOING.lock().unwrap().clear();
+        hd_send_chord('c' as c_int, 4);
+        let chord_packets = OUTGOING.lock().unwrap().clone();
+        let last_chord_key = key_event_fields(chord_packets.last().unwrap());
+        assert_eq!(last_chord_key, (Some(29), None, true, vec![]));
+        assert!(chord_packets.iter().any(|packet| key_event_fields(packet).1 == Some('c' as u32)));
+        let chord_shift_up = chord_packets.iter().position(|packet| {
+            key_event_fields(packet) == (Some(29), None, false, vec![])
+        }).expect("chord macro releases physical Shift first");
+        let chord_press = chord_packets.iter().position(|packet| {
+            key_event_fields(packet) == (None, Some('c' as u32), true, vec![4])
+        }).expect("chord macro emits Ctrl+C");
+        assert!(chord_shift_up < chord_press);
+
+        HARDWARE_MODIFIER_MASK.store(0, Ordering::SeqCst);
+        OUTGOING.lock().unwrap().clear();
+    }
+
+    fn build_inner(compress: bool, content: &[u8], format: u64) -> Vec<u8> {
+        let mut inner = Vec::new();
+        if compress {
+            encode_varint_field(&mut inner, 1, 1);
+        }
+        encode_bytes(&mut inner, 2, content);
+        if format != 0 {
+            encode_varint_field(&mut inner, 5, format);
+        }
+        inner
+    }
+
+    fn try_accept(inner: &[u8]) -> Result<String, String> {
+        let text = parse_clipboard_text(inner)?;
+        accept_remote_clipboard(text.clone());
+        Ok(text)
+    }
+
+    #[test]
+    fn uncompressed_text_roundtrip() {
+        let _g = lock_test();
+        reset_slot();
+        // Mix: leading/trailing spaces, tabs, CRLF, indentation, quotes,
+        // backticks, backslashes, Chinese, emoji, combining marks.
+        let sample = "  Hello,\tworld!\r\n\t\tprintln!(\"a\\b`c\");\n中文 🦀 é\n";
+        let inner = build_inner(false, sample.as_bytes(), 0);
+        let out = try_accept(&inner).expect("parse ok");
+        assert_eq!(out, sample, "uncompressed text must round-trip exactly");
+        assert_eq!(CLIPBOARD_SEQ.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn compressed_text_roundtrip() {
+        let _g = lock_test();
+        reset_slot();
+        // Long enough that zstd will actually compress meaningfully.
+        let sample: String = std::iter::repeat("RustDesk-🦀-粘贴-clipboard-test\t").take(200).collect();
+        let mut compressed = Vec::new();
+        // ruzstd 0.9 only implements Uncompressed + Fastest; Fastest still
+        // produces a real zstd frame that the StreamingDecoder can decode.
+        ruzstd::encoding::compress(
+            &mut sample.as_bytes(),
+            &mut compressed,
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        assert!(!compressed.is_empty(), "zstd frame must be non-empty");
+        let inner = build_inner(true, &compressed, 0);
+        let out = try_accept(&inner).expect("parse ok");
+        assert_eq!(out, sample, "compressed text must round-trip exactly");
+        assert_eq!(CLIPBOARD_SEQ.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn non_text_format_rejected() {
+        let _g = lock_test();
+        reset_slot();
+        // format=1 (Bitmap) — peer would be sending image clipboard, ignore.
+        let inner = build_inner(false, b"hello", 1);
+        assert!(parse_clipboard_text(&inner).is_err());
+        assert_eq!(CLIPBOARD_SEQ.load(Ordering::SeqCst), 0, "seq must not bump");
+    }
+
+    #[test]
+    fn malformed_utf8_rejected() {
+        let _g = lock_test();
+        reset_slot();
+        // 0xFF 0xFE is never valid UTF-8.
+        let inner = build_inner(false, &[0xFF, 0xFE, b'x'], 0);
+        assert!(parse_clipboard_text(&inner).is_err());
+        assert_eq!(CLIPBOARD_SEQ.load(Ordering::SeqCst), 0, "seq must not bump");
+    }
+
+    #[test]
+    fn oversized_zstd_output_rejected() {
+        let _g = lock_test();
+        reset_slot();
+        // Bogus zstd input — must not panic and must not bump seq.
+        let bogus: Vec<u8> = vec![0xFF; 16];
+        let inner = build_inner(true, &bogus, 0);
+        let _ = parse_clipboard_text(&inner); // ignore Err; safety is what matters
+        assert_eq!(CLIPBOARD_SEQ.load(Ordering::SeqCst), 0, "bogus must not bump seq");
+    }
+
+    #[test]
+    fn oversized_decompressed_output_rejected() {
+        let _g = lock_test();
+        reset_slot();
+        // Build a real zstd-compressed payload that decodes to strictly
+        // more than CLIPBOARD_MAX_OUTPUT (8 MiB). This exercises the
+        // per-chunk decompressed-size guard inside `parse_clipboard_text`
+        // — the bogus-bytes test above only proves we do not panic on
+        // malformed headers, not that the bomb guard fires.
+        let target: usize = CLIPBOARD_MAX_OUTPUT + 4096;
+        let plain: Vec<u8> = std::iter::repeat(b'A').take(target).collect();
+        let mut compressed = Vec::new();
+        ruzstd::encoding::compress(
+            &mut plain.as_slice(),
+            &mut compressed,
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        assert!(!compressed.is_empty(), "zstd frame must be non-empty");
+        let inner = build_inner(true, &compressed, 0);
+        let result = parse_clipboard_text(&inner);
+        assert!(
+            result.is_err(),
+            "decompressed > 8 MiB must be rejected; got {} chars",
+            result.as_ref().map(|s| s.len()).unwrap_or(0)
+        );
+        assert_eq!(
+            CLIPBOARD_SEQ.load(Ordering::SeqCst),
+            0,
+            "oversized decompressed output must not bump seq"
+        );
+        // Slot must remain empty (no half-stored truncated text).
+        let stored = CLIPBOARD_TEXT.lock().map(|s| s.is_empty()).unwrap_or(true);
+        assert!(stored, "oversized payload must not leave partial text in slot");
+    }
+
+    #[test]
+    fn missing_content_field_accepted_as_empty() {
+        let _g = lock_test();
+        reset_slot();
+        // Empty inner — defaults: compress=false, format=Text(0), content="" .
+        let inner = Vec::new();
+        let out = parse_clipboard_text(&inner).expect("empty payload is valid Text");
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn ffi_seq_increments_only_on_accept() {
+        let _g = lock_test();
+        reset_slot();
+        assert_eq!(hd_clipboard_seq(), 0);
+        // Rejected payloads must not bump.
+        assert!(parse_clipboard_text(&build_inner(false, &[0xFF, 0xFE], 0)).is_err());
+        assert!(parse_clipboard_text(&build_inner(false, b"x", 99)).is_err());
+        assert_eq!(hd_clipboard_seq(), 0, "rejected must not bump seq");
+        // Accepted payload bumps.
+        let inner = build_inner(false, b"hello world", 0);
+        try_accept(&inner).expect("accept");
+        assert_eq!(hd_clipboard_seq(), 1);
+        // Reading the text via FFI returns the stored string.
+        let mut buf = vec![0u8; 64];
+        let n = hd_copy_clipboard_text(
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len() as c_int,
+        );
+        assert!(n > 0, "ffio copy must report bytes");
+        let written = std::ffi::CStr::from_bytes_until_nul(&buf).unwrap();
+        assert_eq!(written.to_str().unwrap(), "hello world");
+    }
+
+    /// Round-trip a >1 MiB payload that mixes 4-byte emoji, 3-byte CJK
+    /// and 1-byte ASCII so every UTF-8 byte length appears. The previous
+    /// `hd_copy_clipboard_text` used a generic byte-truncating helper, so
+    /// any payload >1 MiB was silently dropped on the C++ side. This test
+    /// locks the size-query + exact-copy contract end-to-end.
+    #[test]
+    fn ffi_clipboard_exact_retrieval_over_1mib() {
+        let _g = lock_test();
+        reset_slot();
+        // Build a payload just over 1 MiB. The mix ensures the final
+        // bytes do not all land on a code-point boundary — a naive
+        // byte-truncator would cut a multi-byte sequence.
+        let unit = "\u{1F980}\u{4E2D}\u{6587}A"; // 🦀 + 中 + 文 + A
+        let mut s = String::with_capacity(1024 * 1024 + 64);
+        while s.len() < 1024 * 1024 + 32 {
+            s.push_str(unit);
+        }
+        assert!(s.len() > 1024 * 1024, "payload must exceed the old 1 MiB cap");
+        let inner = build_inner(false, s.as_bytes(), 0);
+        try_accept(&inner).expect("accept");
+        assert_eq!(hd_clipboard_seq(), 1, "accept must bump seq once");
+
+        // (1) Size query with null buffer must return the exact required
+        //     byte length without writing.
+        let required = hd_copy_clipboard_text(std::ptr::null_mut(), 0);
+        assert_eq!(
+            required as usize,
+            s.len(),
+            "size query must return exact required bytes"
+        );
+
+        // (2) Size query with len=0 must also return the size (no write).
+        let required2 = hd_copy_clipboard_text(std::ptr::null_mut(), 0);
+        assert_eq!(required2, required);
+
+        // (3) Too-small buffer: must report the required size WITHOUT
+        //     partial-copying any bytes. The previous implementation
+        //     truncated to len-1 here and would have split a code point.
+        let mut small = vec![0u8; 64];
+        let n = hd_copy_clipboard_text(
+            small.as_mut_ptr() as *mut c_char,
+            small.len() as c_int,
+        );
+        assert_eq!(
+            n as usize,
+            s.len(),
+            "too-small buffer must report required size, not partial"
+        );
+        assert!(
+            small.iter().all(|b| *b == 0),
+            "too-small buffer must remain untouched (no partial UTF-8 write)"
+        );
+
+        // (4) Sufficient buffer: copy all bytes + trailing NUL exactly.
+        let mut big = vec![0u8; s.len() + 1];
+        let n = hd_copy_clipboard_text(
+            big.as_mut_ptr() as *mut c_char,
+            big.len() as c_int,
+        );
+        assert_eq!(n as usize, s.len(), "exact copy returns required bytes");
+        assert_eq!(&big[..s.len()], s.as_bytes(), "FFI must return exact UTF-8");
+        assert_eq!(big[s.len()], 0, "NUL terminator at exact end position");
+
+        // (5) Round-trip through CStr validates zero internal NULs and
+        //     re-decodes byte-for-byte to the original string.
+        let cstr = std::ffi::CStr::from_bytes_until_nul(&big).expect("NUL-terminated");
+        assert_eq!(
+            cstr.to_str().expect("valid UTF-8").as_bytes(),
+            s.as_bytes(),
+            "CStr round-trip must be byte-for-byte identical"
+        );
+    }
+
+    // ===== Stage 3A: MultiClipboards (field 28) — Windows controlled side =====
+    //
+    // RustDesk >= 1.3.3 controlled side dispatches every clipboard update
+    // as Message field 28 `MultiClipboards`, whose repeated `clipboards`
+    // (field 1) entries are themselves `Clipboard` messages. The previous
+    // handler only logged `multi-clipboard bytes=...` and never bumped
+    // `CLIPBOARD_SEQ`, so JS-side copies from Windows to this pad timed
+    // out. The tests below lock the `parse_multi_clipboards_text` helper
+    // contract: the first valid Text entry wins; non-text / malformed /
+    // oversized entries are skipped; the seq only bumps when a Text
+    // payload is actually accepted. Compressed Text must round-trip
+    // exactly through the same path.
+
+    /// Build a MultiClipboards inner payload whose repeated clipboards
+    /// (field 1) entries are joined as raw protobuf bytes — matches the
+    /// shape RustDesk controlled side sends for clipboard updates.
+    fn build_multi_inner(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut inner = Vec::new();
+        for entry in entries {
+            encode_bytes(&mut inner, 1, entry);
+        }
+        inner
+    }
+
+    /// Mirror the field-28 dispatch path: parse → accept. Returns the
+    /// parsed text on success, `None` when no valid Text entry was found
+    /// (in which case the seq counter must stay untouched).
+    fn try_accept_multi(inner: &[u8]) -> Option<String> {
+        let text = parse_multi_clipboards_text(inner)?;
+        accept_remote_clipboard(text.clone());
+        Some(text)
+    }
+
+    /// (1) MultiClipboards `clipboards` field-1 carrying exact Unicode /
+    /// multiline Text must increment seq once and round-trip via FFI.
+    #[test]
+    fn multi_clipboards_text_increments_seq_once() {
+        let _g = lock_test();
+        reset_slot();
+        // Mix: leading/trailing spaces, tabs, CRLF, indentation, quotes,
+        // backticks, backslashes, Chinese, emoji, combining marks.
+        let sample = "  Hello,\tworld!\r\n\t\tprintln!(\"a\\b`c\");\n中文 🦀 é\n";
+        let entry = build_inner(false, sample.as_bytes(), 0);
+        let inner = build_multi_inner(&[entry]);
+        let out = try_accept_multi(&inner).expect("text found");
+        assert_eq!(
+            out, sample,
+            "multi-clipboard text must round-trip exactly"
+        );
+        assert_eq!(
+            CLIPBOARD_SEQ.load(Ordering::SeqCst),
+            1,
+            "multi-clipboard text must bump seq once"
+        );
+        // Slot must hold the exact UTF-8 for FFI retrieval.
+        let stored = CLIPBOARD_TEXT.lock().map(|s| s.clone()).unwrap_or_default();
+        assert_eq!(
+            stored, sample,
+            "slot must hold exact UTF-8 for FFI retrieval"
+        );
+    }
+
+    /// (2) Non-text entry before a valid Text must not prevent finding
+    /// the Text entry — iteration keeps scanning after skipped entries.
+    #[test]
+    fn multi_clipboards_skips_non_text_to_find_text() {
+        let _g = lock_test();
+        reset_slot();
+        let non_text = build_inner(false, b"image-bytes", 1); // Bitmap
+        let text = build_inner(false, "末尾 text 🦀".as_bytes(), 0);
+        let inner = build_multi_inner(&[non_text, text]);
+        let out = try_accept_multi(&inner).expect("text found");
+        assert_eq!(out, "末尾 text 🦀");
+        assert_eq!(
+            CLIPBOARD_SEQ.load(Ordering::SeqCst),
+            1,
+            "text after non-text must bump seq once"
+        );
+    }
+
+    /// (3) Only non-text entries must not bump seq and must leave the
+    /// slot empty — protects the "new clipboard" edge trigger from
+    /// spurious Bitmap/File clipboard writes.
+    #[test]
+    fn multi_clipboards_only_non_text_does_not_bump_seq() {
+        let _g = lock_test();
+        reset_slot();
+        let non_text_a = build_inner(false, b"image-bytes", 1); // Bitmap
+        let non_text_b = build_inner(false, b"<html></html>", 2); // non-Text
+        let inner = build_multi_inner(&[non_text_a, non_text_b]);
+        assert!(try_accept_multi(&inner).is_none());
+        assert_eq!(
+            CLIPBOARD_SEQ.load(Ordering::SeqCst),
+            0,
+            "non-text only must not bump seq"
+        );
+        let stored = CLIPBOARD_TEXT
+            .lock()
+            .map(|s| s.is_empty())
+            .unwrap_or(true);
+        assert!(
+            stored,
+            "non-text only must leave slot empty (no stale payload)"
+        );
+    }
+
+    /// (4) Malformed UTF-8 and oversized zstd output inside Text entries
+    /// must not bump seq — preserves existing parse_clipboard_text
+    /// safety/exactness through the new field-28 path. Includes a real
+    /// decompression bomb to exercise the 8MiB guard.
+    #[test]
+    fn multi_clipboards_malformed_text_does_not_bump_seq() {
+        let _g = lock_test();
+        reset_slot();
+        // Bad UTF-8 inside an otherwise-Text entry must be rejected.
+        let bad_utf8 = build_inner(false, &[0xFF, 0xFE, b'x'], 0);
+        let inner = build_multi_inner(&[bad_utf8]);
+        assert!(try_accept_multi(&inner).is_none());
+        assert_eq!(
+            CLIPBOARD_SEQ.load(Ordering::SeqCst),
+            0,
+            "malformed utf-8 text must not bump seq"
+        );
+
+        // Decompression bomb (>8 MiB plain) inside a Text entry must
+        // also be rejected by the inner parser's per-chunk guard.
+        let target: usize = CLIPBOARD_MAX_OUTPUT + 4096;
+        let plain: Vec<u8> = std::iter::repeat(b'A').take(target).collect();
+        let mut compressed = Vec::new();
+        ruzstd::encoding::compress(
+            &mut plain.as_slice(),
+            &mut compressed,
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        assert!(!compressed.is_empty(), "zstd frame must be non-empty");
+        let bomb = build_inner(true, &compressed, 0);
+        let inner = build_multi_inner(&[bomb]);
+        assert!(try_accept_multi(&inner).is_none());
+        assert_eq!(
+            CLIPBOARD_SEQ.load(Ordering::SeqCst),
+            0,
+            "zstd bomb through multi-clipboard must not bump seq"
+        );
+    }
+
+    /// (5) Compressed Text path must still round-trip exactly through
+    /// `parse_multi_clipboards_text` — same exactness guarantee as the
+    /// legacy field-16 path.
+    #[test]
+    fn multi_clipboards_compressed_text_roundtrip() {
+        let _g = lock_test();
+        reset_slot();
+        let sample: String =
+            std::iter::repeat("RustDesk-🦀-粘贴-clipboard-test\t").take(200).collect();
+        let mut compressed = Vec::new();
+        ruzstd::encoding::compress(
+            &mut sample.as_bytes(),
+            &mut compressed,
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        assert!(!compressed.is_empty(), "zstd frame must be non-empty");
+        let entry = build_inner(true, &compressed, 0);
+        let inner = build_multi_inner(&[entry]);
+        let out = try_accept_multi(&inner).expect("text found");
+        assert_eq!(
+            out, sample,
+            "compressed text must round-trip exactly through multi-clipboards"
+        );
+        assert_eq!(CLIPBOARD_SEQ.load(Ordering::SeqCst), 1);
+    }
 }
