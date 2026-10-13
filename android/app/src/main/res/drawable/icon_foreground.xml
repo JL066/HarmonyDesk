@@ -1,3 +1,4 @@
-<inset xmlns:android="http://schemas.android.com/apk/res/android" android:inset="6dp">
+<!-- Scale with the drawable bounds: adaptive foregrounds extend beyond the launcher mask. -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android" android:inset="18%">
     <bitmap android:src="@drawable/remotedesk_icon" android:gravity="fill"/>
 </inset>
