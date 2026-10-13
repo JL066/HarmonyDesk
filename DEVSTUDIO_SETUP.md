@@ -1,5 +1,14 @@
 # DevEco Studio 项目打开问题排查
 
+## 仓库与工具路径
+
+文中的 `HARMONYDESK_ROOT` 指向你自己的仓库根目录，项目目录为其下的 `ohos`。本机路径只在终端环境变量或被忽略的本地配置中设置，不写入仓库。
+
+- Windows HAP 构建使用 `DEVECO_STUDIO_HOME`；未设置时按系统的 `ProgramFiles` 位置查找 DevEco Studio。已有的 `JAVA_HOME`、`NODE_HOME`、`DEVECO_SDK_HOME` 和 `OHOS_BASE_SDK_HOME` 会被保留。
+- Native 构建可设置 `OHOS_NATIVE_HOME`，或通过 `OHOS_SDK_HOME` / `DEVECO_SDK_HOME` 查找 native 工具链。需要 MinGW 时设置 `MINGW_HOME` 或将其加入当前终端的 `PATH`。
+- 设备辅助脚本通过 `HDC_PATH` 或 `PATH` 查找 `hdc`。鼠标追踪脚本还需要 `HDC_DEVICE_ID` 或 `-DeviceId` 参数；设备标识和追踪日志不要提交。
+- 安装辅助脚本不再查询或打印设备 UDID。上述脚本不会修改全局环境变量。
+
 ## 问题: "Select an OpenHarmony or HarmonyOS project" 错误
 
 这个错误表示 DevEco Studio 无法识别项目结构。以下是解决步骤:
@@ -12,7 +21,7 @@
 2. **删除 DevEco Studio 缓存**
    ```bash
    # 删除 .idea 目录（如果存在）
-   cd /Users/lewin/workspace/lewinz/HarmonyDesk/harmonyos
+   cd "${HARMONYDESK_ROOT:?Set HARMONYDESK_ROOT to your checkout}/ohos"
    rm -rf .idea
    rm -f .idea/
    ```
@@ -66,7 +75,7 @@
 
 4. **更新 local.properties**
    ```bash
-   cd /Users/lewin/workspace/lewinz/HarmonyDesk/harmonyos
+   cd "${HARMONYDESK_ROOT:?Set HARMONYDESK_ROOT to your checkout}/ohos"
    echo "sdk.dir=$HOME/HarmonyOS/Sdk" > local.properties
    ```
 
@@ -76,7 +85,7 @@
 
 1. **创建项目标记文件**
    ```bash
-   cd /Users/lewin/workspace/lewinz/HarmonyDesk/harmonyos
+   cd "${HARMONYDESK_ROOT:?Set HARMONYDESK_ROOT to your checkout}/ohos"
    touch .project
    ```
 
@@ -90,7 +99,7 @@
 如果 DevEco Studio 仍有问题，可以先用命令行测试:
 
 ```bash
-cd /Users/lewin/workspace/lewinz/HarmonyDesk/harmonyos
+cd "${HARMONYDESK_ROOT:?Set HARMONYDESK_ROOT to your checkout}/ohos"
 
 # 如果有 hvigorw 脚本
 ./hvigorw --version
@@ -105,7 +114,7 @@ npm run build
 运行以下命令检查项目是否完整:
 
 ```bash
-cd /Users/lewin/workspace/lewinz/HarmonyDesk/harmonyos
+cd "${HARMONYDESK_ROOT:?Set HARMONYDESK_ROOT to your checkout}/ohos"
 
 # 1. 检查必需文件
 ls -la build-profile.json5

@@ -7,18 +7,23 @@ $CoreDir = Join-Path $RepoRoot "ohos\entry\ohos\hdcore"
 $LibOut = Join-Path $RepoRoot "ohos\entry\libs\arm64-v8a"
 $Target = "aarch64-unknown-linux-ohos"
 
-$mingw = "C:\ProgramData\mingw64\mingw64\bin"
-$env:PATH = "$mingw;$env:USERPROFILE\.cargo\bin;" + $env:PATH
+if ($env:MINGW_HOME) {
+  $env:PATH = "$(Join-Path $env:MINGW_HOME 'bin');" + $env:PATH
+}
+$env:PATH = "$env:USERPROFILE\.cargo\bin;" + $env:PATH
 
 if (-not $env:OHOS_NATIVE_HOME) {
-  $candidates = @(
-    "C:\Users\Administrator\Projects\ohos-sdk\native",
-    "C:\Users\Administrator\Projects\ohos-sdk\windows\native",
-    "$env:LOCALAPPDATA\Huawei\Sdk\openharmony\native"
-  )
-  Get-ChildItem "C:\Users\Administrator\Projects\ohos-sdk" -Directory -Recurse -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -eq "native" -and (Test-Path (Join-Path $_.FullName "llvm\bin\clang.exe")) } |
-    ForEach-Object { $candidates += $_.FullName }
+  $candidates = @()
+  foreach ($sdkRoot in @($env:OHOS_SDK_HOME, $env:DEVECO_SDK_HOME)) {
+    if ($sdkRoot) {
+      foreach ($relative in @('native', 'windows\native', 'default\openharmony\native')) {
+        $candidates += Join-Path $sdkRoot $relative
+      }
+    }
+  }
+  if ($env:LOCALAPPDATA) {
+    $candidates += Join-Path $env:LOCALAPPDATA 'Huawei\Sdk\openharmony\native'
+  }
   foreach ($c in $candidates) {
     if (Test-Path (Join-Path $c "llvm\bin\clang.exe")) {
       $env:OHOS_NATIVE_HOME = $c

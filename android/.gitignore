@@ -1,0 +1,16 @@
+/.gradle/
+/local.properties
+/**/build/
+/**/.cxx/
+/app/src/main/jniLibs/
+*.keystore
+*.jks
+*.apk
+*.aab
+*.apks
+*.key
+*.pem
+/signing.properties
+/.native-build/
+/.captures/
+/.javac-check/

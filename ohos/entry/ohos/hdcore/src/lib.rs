@@ -24,6 +24,8 @@ const STATUS_FAILED: i32 = 3;
 static STATUS: AtomicI32 = AtomicI32::new(STATUS_IDLE);
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static CONNECT_GEN: AtomicI32 = AtomicI32::new(0);
+/// Serializes session-owned state updates with connect/disconnect resets.
+static SESSION_STATE: Mutex<()> = Mutex::new(());
 static CHECK_GEN: AtomicI32 = AtomicI32::new(0);
 static CHECK_RESULT: Mutex<String> = Mutex::new(String::new());
 static FRAME_COUNT: AtomicI32 = AtomicI32::new(0);
@@ -31,6 +33,11 @@ static SERVER: Mutex<String> = Mutex::new(String::new());
 static RELAY: Mutex<String> = Mutex::new(String::new());
 static KEY: Mutex<String> = Mutex::new(String::new());
 static FORCE_RELAY: AtomicBool = AtomicBool::new(false);
+// 0 preserves the existing FORCE_RELAY behavior, 1 forces relay for ID peers,
+// and 2 only tries an explicitly server-classified private LAN candidate.
+static ROUTE_POLICY: AtomicI32 = AtomicI32::new(0);
+// 0 pending, 1 LAN direct, 2 relay, 3 legacy/explicit direct.
+static ROUTE_KIND: AtomicI32 = AtomicI32::new(0);
 static DIRECT_IP_SESSION: AtomicBool = AtomicBool::new(false);
 /// High-quality profile (same knobs as IP direct). Set by direct-ip or UI「高清」.
 static HD_PROFILE: AtomicBool = AtomicBool::new(false);
@@ -56,7 +63,11 @@ static LAST_REFRESH_ASK_MS: AtomicI64 = AtomicI64::new(0);
 static LAST_AUTO_FPS: AtomicI32 = AtomicI32::new(0);
 static TEST_DELAY_ECHOED: AtomicI32 = AtomicI32::new(0);
 static LAST_TEST_DELAY_CLEAR_MS: AtomicI64 = AtomicI64::new(0);
-static OUTGOING: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+struct OutgoingMessage {
+    generation: i32,
+    frame: Vec<u8>,
+}
+static OUTGOING: Mutex<Vec<OutgoingMessage>> = Mutex::new(Vec::new());
 static LAST_MOUSE: Mutex<(i32, i32)> = Mutex::new((0, 0));
 // Exact held physical modifiers from HarmonyOS. MouseEvent carries a modifier
 // list too, so Ctrl/Shift/Alt/Meta remain effective during pointer input.
@@ -292,6 +303,69 @@ fn normalize_direct_addr(raw: &str) -> String {
     format!("{s}:21118")
 }
 
+fn effective_force_relay(policy: i32, configured_force_relay: bool) -> bool {
+    match policy {
+        1 => true,
+        2 => false,
+        _ => configured_force_relay,
+    }
+}
+
+fn is_current_session(generation: i32) -> bool {
+    session_generation_matches(CONNECT_GEN.load(Ordering::SeqCst), generation)
+}
+
+fn session_generation_matches(current: i32, candidate: i32) -> bool {
+    current == candidate
+}
+
+fn ensure_current_session(generation: i32) -> Result<(), String> {
+    if is_current_session(generation) {
+        Ok(())
+    } else {
+        Err("stale session generation".to_string())
+    }
+}
+
+/// Run a short session-state mutation atomically with connect/disconnect reset.
+fn with_current_session<T>(generation: i32, f: impl FnOnce() -> T) -> Option<T> {
+    let _guard = SESSION_STATE.lock().unwrap_or_else(|p| p.into_inner());
+    if !is_current_session(generation) {
+        return None;
+    }
+    Some(f())
+}
+
+fn auto_lan_candidate(raw: &str) -> Option<std::net::SocketAddr> {
+    let addr = raw.parse::<std::net::SocketAddr>().ok()?;
+    let std::net::SocketAddr::V4(v4) = &addr else {
+        return None;
+    };
+    let ip = *v4.ip();
+    if v4.port() == 0
+        || !ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || ip.is_unspecified()
+    {
+        return None;
+    }
+    Some(addr)
+}
+
+fn connect_auto_lan(raw: &str) -> Result<TcpStream, String> {
+    let addr = auto_lan_candidate(raw).ok_or_else(|| "not a private unicast LAN candidate".to_string())?;
+    append_log("try server-classified private LAN candidate");
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(1500))
+        .map_err(|e| format!("LAN direct connect: {e}"))?;
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(4)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+    Ok(stream)
+}
+
 fn encode_varint(out: &mut Vec<u8>, mut value: u64) {
     loop {
         let mut byte = (value & 0x7f) as u8;
@@ -332,7 +406,10 @@ fn encode_sint32_field(out: &mut Vec<u8>, field: u32, value: i32) {
 
 fn enqueue_msg_front(payload: Vec<u8>) {
     if let Ok(mut queue) = OUTGOING.lock() {
-        queue.insert(0, frame_message(&payload));
+        queue.insert(0, OutgoingMessage {
+            generation: CONNECT_GEN.load(Ordering::SeqCst),
+            frame: frame_message(&payload),
+        });
     }
 }
 
@@ -343,7 +420,10 @@ fn enqueue_msg(payload: Vec<u8>) {
             let drop_n = queue.len() - 80;
             queue.drain(..drop_n);
         }
-        queue.push(frame_message(&payload));
+        queue.push(OutgoingMessage {
+            generation: CONNECT_GEN.load(Ordering::SeqCst),
+            frame: frame_message(&payload),
+        });
     }
 }
 
@@ -359,9 +439,9 @@ fn write_msg(stream: &mut TcpStream, payload: &[u8]) -> bool {
     write_raw(stream, &frame_message(payload))
 }
 
-fn flush_outgoing(stream: &mut TcpStream) {
+fn flush_outgoing(stream: &mut TcpStream, generation: i32) {
     let messages = match OUTGOING.lock() {
-        Ok(mut queue) => std::mem::take(&mut *queue),
+        Ok(mut queue) => take_outgoing_for_generation(&mut queue, generation),
         Err(_) => return,
     };
     if messages.is_empty() {
@@ -372,10 +452,28 @@ fn flush_outgoing(stream: &mut TcpStream) {
         Err(_) => return,
     };
     for message in messages {
+        if !is_current_session(generation) {
+            break;
+        }
         if stream.write_all(&message).is_err() {
             break;
         }
     }
+}
+
+fn take_outgoing_for_generation(queue: &mut Vec<OutgoingMessage>, generation: i32) -> Vec<Vec<u8>> {
+    let mut messages = Vec::new();
+    let mut future = Vec::new();
+    for message in queue.drain(..) {
+        if message.generation == generation {
+            messages.push(message.frame);
+        } else if message.generation.wrapping_sub(generation) > 0 {
+            // A stale writer must leave messages for a newer session alone.
+            future.push(message);
+        }
+    }
+    *queue = future;
+    messages
 }
 
 fn build_mouse_event(mask: i32, x: i32, y: i32) -> Vec<u8> {
@@ -718,9 +816,11 @@ fn is_timeout(err: &std::io::Error) -> bool {
 fn read_all(stream: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> Result<(), String> {
     let mut got = 0;
     while got < buf.len() {
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(format!("payload timeout got={got} need={}", buf.len()));
         }
+        let _ = stream.set_read_timeout(Some(remaining.max(Duration::from_millis(1))));
         match stream.read(&mut buf[got..]) {
             Ok(0) => return Err("eof".into()),
             Ok(n) => got += n,
@@ -783,7 +883,27 @@ fn frame_message(payload: &[u8]) -> Vec<u8> {
 }
 
 fn read_framed(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    read_framed_with_deadlines(
+        stream,
+        Instant::now() + Duration::from_secs(2),
+        None,
+    )
+}
+
+fn read_framed_until(stream: &mut TcpStream, deadline: Instant) -> Result<Vec<u8>, String> {
+    read_framed_with_deadlines(stream, deadline, Some(deadline))
+}
+
+fn read_framed_with_deadlines(
+    stream: &mut TcpStream,
+    header_deadline: Instant,
+    body_deadline: Option<Instant>,
+) -> Result<Vec<u8>, String> {
+    let header_remaining = header_deadline.saturating_duration_since(Instant::now());
+    if header_remaining.is_zero() {
+        return Err("read header: timeout".into());
+    }
+    let _ = stream.set_read_timeout(Some(header_remaining.max(Duration::from_millis(1))));
     let mut first = [0u8; 1];
     match stream.read(&mut first) {
         Ok(0) => return Err("eof".into()),
@@ -791,8 +911,12 @@ fn read_framed(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
         Err(e) if is_timeout(&e) => return Err("idle".into()),
         Err(e) => return Err(format!("read header: {e}")),
     }
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(8)));
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = body_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(8));
+    let body_remaining = deadline.saturating_duration_since(Instant::now());
+    if body_remaining.is_zero() {
+        return Err("read frame: timeout".into());
+    }
+    let _ = stream.set_read_timeout(Some(body_remaining.max(Duration::from_millis(1))));
     let head_len = ((first[0] & 0x3) + 1) as usize;
     let mut header = vec![first[0]];
     if head_len > 1 {
@@ -874,7 +998,12 @@ fn hex_preview(data: &[u8], max: usize) -> String {
 
 /// Read rendezvous frames until PunchHoleResponse / RelayResponse.
 /// Newer hbbs may send KeyExchange (field 25) first — official client skips it.
-fn read_punch_result(stream: &mut TcpStream) -> Result<String, String> {
+struct PunchResult {
+    detail: String,
+    is_local: bool,
+}
+
+fn read_punch_result_info(stream: &mut TcpStream) -> Result<PunchResult, String> {
     for attempt in 0..8 {
         let payload = match read_framed(stream) {
             Ok(p) => p,
@@ -896,16 +1025,16 @@ fn read_punch_result(stream: &mut TcpStream) -> Result<String, String> {
             append_log("skip ConfigUpdate");
             continue;
         }
-        if let Some(detail) = parse_punch_response(&payload) {
-            return Ok(detail);
+        if let Some(result) = parse_punch_response_info(&payload) {
+            return Ok(result);
         }
         if let Ok(info) = parse_relay_response(&payload) {
             // uuid [relay] — treat as online via relay
             let relay = info.split_whitespace().nth(1).unwrap_or("");
             if relay.is_empty() {
-                return Ok("ONLINE_RELAY".to_string());
+                return Ok(PunchResult { detail: "ONLINE_RELAY".to_string(), is_local: false });
             }
-            return Ok(format!("ONLINE_RELAY {relay}"));
+            return Ok(PunchResult { detail: format!("ONLINE_RELAY {relay}"), is_local: false });
         }
         append_log(&format!(
             "unrecognized rendezvous hex={}",
@@ -916,7 +1045,11 @@ fn read_punch_result(stream: &mut TcpStream) -> Result<String, String> {
     Err("no punch response".to_string())
 }
 
-fn parse_punch_response(payload: &[u8]) -> Option<String> {
+fn read_punch_result(stream: &mut TcpStream) -> Result<String, String> {
+    read_punch_result_info(stream).map(|result| result.detail)
+}
+
+fn parse_punch_response_info(payload: &[u8]) -> Option<PunchResult> {
     let mut index = 0;
     while let Some((field, value)) = next_field(payload, &mut index) {
         if field != 11 {
@@ -930,6 +1063,7 @@ fn parse_punch_response(payload: &[u8]) -> Option<String> {
         let mut relay = String::new();
         let mut other = String::new();
         let mut peer_addr = String::new();
+        let mut is_local = false;
         while let Some((inner_field, inner_value)) = next_field(inner, &mut inner_index) {
             match (inner_field, inner_value) {
                 (1, ProtoValue::Bytes(addr)) if !addr.is_empty() => {
@@ -939,12 +1073,16 @@ fn parse_punch_response(payload: &[u8]) -> Option<String> {
                 }
                 (3, ProtoValue::Varint(code)) => failure = Some(code),
                 (4, ProtoValue::Bytes(text)) => relay = String::from_utf8_lossy(text).into_owned(),
+                // nat_type and is_local share a protobuf oneof; whichever appears last wins.
+                (5, ProtoValue::Varint(_)) => is_local = false,
+                // PunchHoleResponse.oneof local routing marker (hbb_common field 6).
+                (6, ProtoValue::Varint(value)) => is_local = value != 0,
                 (7, ProtoValue::Bytes(text)) => other = String::from_utf8_lossy(text).into_owned(),
                 _ => {}
             }
         }
         if !other.is_empty() {
-            return Some(format!("other_failure:{other}"));
+            return Some(PunchResult { detail: format!("other_failure:{other}"), is_local });
         }
         if let Some(code) = failure {
             let name = match code {
@@ -954,19 +1092,19 @@ fn parse_punch_response(payload: &[u8]) -> Option<String> {
                 4 => "LICENSE_OVERUSE",
                 _ => "UNKNOWN_FAILURE",
             };
-            return Some(name.to_string());
+            return Some(PunchResult { detail: name.to_string(), is_local });
         }
         // Prefer direct peer addr when present; keep relay as fallback hint.
         if !peer_addr.is_empty() {
             if relay.is_empty() {
-                return Some(format!("ONLINE_DIRECT {peer_addr}"));
+                return Some(PunchResult { detail: format!("ONLINE_DIRECT {peer_addr}"), is_local });
             }
-            return Some(format!("ONLINE_DIRECT {peer_addr}|{relay}"));
+            return Some(PunchResult { detail: format!("ONLINE_DIRECT {peer_addr}|{relay}"), is_local });
         }
         if !relay.is_empty() {
-            return Some(format!("ONLINE_RELAY {relay}"));
+            return Some(PunchResult { detail: format!("ONLINE_RELAY {relay}"), is_local });
         }
-        return Some("EMPTY_RESPONSE".to_string());
+        return Some(PunchResult { detail: "EMPTY_RESPONSE".to_string(), is_local });
     }
     None
 }
@@ -1619,8 +1757,10 @@ fn maybe_clear_test_delay(stream: &mut TcpStream) {
     }
 }
 
-fn spawn_writer(stream: &TcpStream) {
-    let gen = CONNECT_GEN.load(Ordering::SeqCst);
+fn spawn_writer(stream: &TcpStream, generation: i32) {
+    if !is_current_session(generation) {
+        return;
+    }
     match stream.try_clone() {
         Ok(mut writer) => {
             let _ = writer.set_nodelay(true);
@@ -1628,14 +1768,19 @@ fn spawn_writer(stream: &TcpStream) {
             let _ = std::thread::Builder::new()
                 .name("hd-write".into())
                 .spawn(move || {
-                    while RUNNING.load(Ordering::SeqCst) && CONNECT_GEN.load(Ordering::SeqCst) == gen {
-                        flush_outgoing(&mut writer);
+                    while RUNNING.load(Ordering::SeqCst) && is_current_session(generation) {
+                        flush_outgoing(&mut writer, generation);
+                        if !is_current_session(generation) {
+                            break;
+                        }
                         maybe_clear_test_delay(&mut writer);
                         let now = now_ms();
                         let last = LAST_VIDEO_MS.load(Ordering::SeqCst);
                         let refresh_ms = if use_hd_profile() { 8000 } else { 6000 };
                         if last == 0 || now - last >= refresh_ms {
-                            ask_refresh_video("writer refresh_video");
+                            let _ = with_current_session(generation, || {
+                                ask_refresh_video("writer refresh_video");
+                            });
                         }
                         std::thread::sleep(Duration::from_millis(if use_hd_profile() {
                             2
@@ -1650,14 +1795,18 @@ fn spawn_writer(stream: &TcpStream) {
     }
 }
 
-fn run_session(stream: &mut TcpStream) {
-    let gen = CONNECT_GEN.load(Ordering::SeqCst);
+fn run_session(stream: &mut TcpStream, generation: i32) {
+    if !is_current_session(generation) {
+        return;
+    }
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_nodelay(true);
-    spawn_writer(stream);
+    spawn_writer(stream, generation);
     if write_msg(stream, &build_profile_option_misc()) {
         let (iq, q, fps) = profile_knobs();
-        LAST_AUTO_FPS.store(fps as i32, Ordering::SeqCst);
+        let _ = with_current_session(generation, || {
+            LAST_AUTO_FPS.store(fps as i32, Ordering::SeqCst);
+        });
         let path = if is_direct_session() { "direct" } else { "relay" };
         append_log(&format!(
             "sent OptionMessage {path} iq={iq} q={q} fps={fps} H265 (write-lock+TestDelay clear)"
@@ -1669,29 +1818,34 @@ fn run_session(stream: &mut TcpStream) {
     if write_msg(stream, &build_refresh_video()) {
         append_log("sent refresh_video");
     }
-    while RUNNING.load(Ordering::SeqCst) && CONNECT_GEN.load(Ordering::SeqCst) == gen {
+    while RUNNING.load(Ordering::SeqCst) && is_current_session(generation) {
         match read_framed(stream) {
             Ok(payload) => {
-                match handle_session_message(&payload) {
-                    Ok(Some(reply)) => {
-                        // TestDelay 等必须立刻写回，且与 writer 共用 STREAM_WRITE。
-                        if !write_raw(stream, &reply) {
-                            append_log("sync reply write fail");
+                let handled = with_current_session(generation, || handle_session_message(&payload));
+                match handled {
+                    None => break,
+                    Some(Ok(Some(reply))) => {
+                        // TestDelay replies are synchronous and share STREAM_WRITE with writer.
+                        if !is_current_session(generation) || !write_raw(stream, &reply) {
+                            append_log("sync reply write fail or stale session");
                             break;
                         }
                     }
-                    Ok(None) => {}
-                    Err(e) => {
+                    Some(Ok(None)) => {}
+                    Some(Err(e)) => {
                         append_log(&format!("session handle {e}"));
                         break;
                     }
                 }
             }
             Err(e) => {
+                if !is_current_session(generation) {
+                    break;
+                }
                 if e == "idle" {
                     let last = LAST_VIDEO_MS.load(Ordering::SeqCst);
                     if last == 0 || now_ms() - last > 2500 {
-                        ask_refresh_video("idle refresh_video");
+                        let _ = with_current_session(generation, || ask_refresh_video("idle refresh_video"));
                     }
                     continue;
                 }
@@ -1704,10 +1858,12 @@ fn run_session(stream: &mut TcpStream) {
         }
     }
     append_log("session loop end");
-    if RUNNING.load(Ordering::SeqCst) && CONNECT_GEN.load(Ordering::SeqCst) == gen {
-        set_error("会话中断");
-        STATUS.store(STATUS_FAILED, Ordering::SeqCst);
-    }
+    let _ = with_current_session(generation, || {
+        if RUNNING.load(Ordering::SeqCst) {
+            set_error("会话中断");
+            STATUS.store(STATUS_FAILED, Ordering::SeqCst);
+        }
+    });
 }
 
 fn parse_hash(inner: &[u8]) -> (String, String) {
@@ -1783,19 +1939,24 @@ fn handshake_after_relay(
     stream: &mut TcpStream,
     peer_id: &str,
     password: &str,
+    generation: i32,
+    route_kind: i32,
+    read_timeout_secs: u64,
 ) -> Result<String, String> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+    let handshake_deadline = Instant::now() + Duration::from_secs(read_timeout_secs);
     let mut got_hash = false;
     for _ in 0..8 {
-        let payload = match read_framed(stream) {
+        let payload = match read_framed_until(stream, handshake_deadline) {
             Ok(payload) => payload,
             Err(e) => {
+                ensure_current_session(generation)?;
                 if got_hash {
                     return Ok(format!("RESULT: LOGIN_SENT {peer_id}"));
                 }
                 return Err(e);
             }
         };
+        ensure_current_session(generation)?;
         append_log(&format!("peer msg {} bytes", payload.len()));
         let mut index = 0;
         let Some((field, value)) = next_field(&payload, &mut index) else {
@@ -1831,12 +1992,20 @@ fn handshake_after_relay(
                 let ProtoValue::Bytes(inner) = value else {
                     continue;
                 };
-                return match parse_login_response(inner) {
+                let parsed = with_current_session(generation, || parse_login_response(inner))
+                    .ok_or_else(|| "stale session generation".to_string())?;
+                return match parsed {
                     Ok(info) => {
                         let result = format!("RESULT: LOGIN_OK {peer_id} {info}");
-                        append_log(&result);
-                        STATUS.store(STATUS_READY, Ordering::SeqCst);
-                        run_session(stream);
+                        let started = with_current_session(generation, || {
+                            ROUTE_KIND.store(route_kind, Ordering::SeqCst);
+                            STATUS.store(STATUS_READY, Ordering::SeqCst);
+                            append_log(&result);
+                        });
+                        if started.is_none() {
+                            return Err("stale session generation".to_string());
+                        }
+                        run_session(stream, generation);
                         Ok(result)
                     }
                     Err(e) => Ok(format!("RESULT: LOGIN_ERROR {peer_id} {e}")),
@@ -1859,7 +2028,9 @@ fn request_and_join_relay(
     peer_id: &str,
     licence_key: &str,
     password: &str,
+    generation: i32,
 ) -> Result<String, String> {
+    ensure_current_session(generation)?;
     let relay = if !relay_hint.is_empty() {
         normalize_relay_addr(relay_hint, id_server)
     } else {
@@ -1869,6 +2040,7 @@ fn request_and_join_relay(
     append_log(&format!("relay request uuid={uuid} via {relay}"));
 
     let mut hbbs = connect_tcp(id_server, 15)?;
+    ensure_current_session(generation)?;
     hbbs.write_all(&frame_message(&build_request_relay(
         peer_id,
         &uuid,
@@ -1879,12 +2051,14 @@ fn request_and_join_relay(
     .map_err(|e| format!("send RequestRelay: {e}"))?;
     append_log("sent RequestRelay to hbbs");
     let payload = read_framed(&mut hbbs).map_err(|e| format!("read RelayResponse: {e}"))?;
+    ensure_current_session(generation)?;
     append_log(&format!("relay response {} bytes", payload.len()));
     let info = parse_relay_response(&payload)?;
     append_log(&format!("RelayResponse ok {info}"));
     drop(hbbs);
 
     let mut hbbr = connect_tcp(&relay, 12)?;
+    ensure_current_session(generation)?;
     hbbr.write_all(&frame_message(&build_request_relay(
         peer_id,
         &uuid,
@@ -1894,7 +2068,7 @@ fn request_and_join_relay(
     )))
     .map_err(|e| format!("send hbbr RequestRelay: {e}"))?;
     append_log("sent RequestRelay to hbbr");
-    match handshake_after_relay(&mut hbbr, peer_id, password) {
+    match handshake_after_relay(&mut hbbr, peer_id, password, generation, 2, 15) {
         Ok(msg) => Ok(msg),
         Err(e) if e.contains("read header") || e.contains("timed out") => {
             append_log(&format!("handshake wait {e}"));
@@ -1917,7 +2091,10 @@ fn check_peer_online(server: &str, peer_id: &str, licence_key: &str) -> Result<S
             }
         };
     }
-    let force_relay = FORCE_RELAY.load(Ordering::SeqCst);
+    let force_relay = effective_force_relay(
+        ROUTE_POLICY.load(Ordering::SeqCst),
+        FORCE_RELAY.load(Ordering::SeqCst),
+    );
     let mut stream = connect_tcp(server, 8)?;
     stream
         .write_all(&frame_message(&build_punch_request(
@@ -1938,15 +2115,21 @@ fn check_peer_online(server: &str, peer_id: &str, licence_key: &str) -> Result<S
     }
 }
 
-fn connect_direct_ip(peer: &str, password: &str) -> Result<String, String> {
-    DIRECT_IP_SESSION.store(true, Ordering::SeqCst);
-    HD_PROFILE.store(true, Ordering::SeqCst);
-    LAST_AUTO_FPS.store(60, Ordering::SeqCst);
+fn connect_direct_ip(peer: &str, password: &str, generation: i32) -> Result<String, String> {
+    let initialized = with_current_session(generation, || {
+        DIRECT_IP_SESSION.store(true, Ordering::SeqCst);
+        HD_PROFILE.store(true, Ordering::SeqCst);
+        LAST_AUTO_FPS.store(60, Ordering::SeqCst);
+    });
+    if initialized.is_none() {
+        return Err("stale session generation".to_string());
+    }
     let addr = normalize_direct_addr(peer);
     append_log(&format!("direct-ip connect {addr} (HD profile)"));
     let mut stream = connect_tcp(&addr, 15)?;
+    ensure_current_session(generation)?;
     append_log("direct-ip tcp ok, start handshake");
-    handshake_after_relay(&mut stream, peer, password)
+    handshake_after_relay(&mut stream, peer, password, generation, 3, 15)
 }
 
 fn lookup_peer(
@@ -1955,12 +2138,16 @@ fn lookup_peer(
     peer_id: &str,
     licence_key: &str,
     password: &str,
+    generation: i32,
+    route_policy: i32,
+    configured_force_relay: bool,
 ) -> Result<String, String> {
     if is_direct_ip_peer(peer_id) {
-        return connect_direct_ip(peer_id, password);
+        return connect_direct_ip(peer_id, password, generation);
     }
-    let force_relay = FORCE_RELAY.load(Ordering::SeqCst);
+    let force_relay = effective_force_relay(route_policy, configured_force_relay);
     let mut stream = connect_tcp(server, 8)?;
+    ensure_current_session(generation)?;
     stream
         .write_all(&frame_message(&build_punch_request(
             peer_id,
@@ -1969,7 +2156,9 @@ fn lookup_peer(
         )))
         .map_err(|e| format!("send punch: {e}"))?;
     append_log("sent PunchHoleRequest");
-    let detail = read_punch_result(&mut stream)?;
+    let punch = read_punch_result_info(&mut stream)?;
+    ensure_current_session(generation)?;
+    let detail = punch.detail;
     match detail.as_str() {
         "OFFLINE" => Ok(format!("RESULT: OFFLINE {peer_id}")),
         "ID_NOT_EXIST" => Ok(format!("RESULT: NOT_EXIST {peer_id}")),
@@ -1983,35 +2172,91 @@ fn lookup_peer(
                     Some((a, r)) => (a, r),
                     None => (rest, ""),
                 };
-                append_log(&format!("try punch-direct {peer_addr}"));
-                match connect_tcp(peer_addr, 8) {
-                    Ok(mut stream) => {
-                        append_log("punch-direct tcp ok, start handshake");
-                        DIRECT_IP_SESSION.store(false, Ordering::SeqCst); // not LAN IP mode, but low-latency path
-                        return handshake_after_relay(&mut stream, peer_id, password);
-                    }
-                    Err(e) => {
-                        append_log(&format!("punch-direct fail {e}, fallback relay"));
-                        let hint = if relay_hint.is_empty() {
-                            ""
-                        } else {
-                            relay_hint
-                        };
-                        return match request_and_join_relay(
-                            server,
-                            hint,
-                            configured_relay,
-                            peer_id,
-                            licence_key,
-                            password,
-                        ) {
-                            Ok(msg) => Ok(msg),
-                            Err(e2) => Ok(format!(
-                                "RESULT: ONLINE {peer_id} PUNCH_FAIL {e} RELAY_FAIL {e2}"
-                            )),
-                        };
+                let may_try_direct = match route_policy {
+                    1 => false,
+                    2 => punch.is_local && auto_lan_candidate(peer_addr).is_some(),
+                    _ => true,
+                };
+                if route_policy == 2 && !may_try_direct {
+                    append_log("auto route skipped direct: server did not mark a private LAN candidate");
+                }
+                let mut direct_failure = String::new();
+                if may_try_direct {
+                    let connected = if route_policy == 2 {
+                        connect_auto_lan(peer_addr)
+                    } else {
+                        append_log(&format!("try punch-direct {peer_addr}"));
+                        connect_tcp(peer_addr, 8)
+                    };
+                    match connected {
+                        Ok(mut direct_stream) => {
+                            ensure_current_session(generation)?;
+                            append_log("direct tcp ok, start handshake");
+                            let _ = with_current_session(generation, || {
+                                DIRECT_IP_SESSION.store(false, Ordering::SeqCst);
+                            });
+                            if route_policy == 2 {
+                                match handshake_after_relay(
+                                    &mut direct_stream,
+                                    peer_id,
+                                    password,
+                                    generation,
+                                    1,
+                                    4,
+                                ) {
+                                    Ok(msg) if msg.contains("LOGIN_OK") || msg.contains("LOGIN_ERROR") => {
+                                        return Ok(msg);
+                                    }
+                                    Ok(msg) => direct_failure = msg,
+                                    Err(e) => {
+                                        if !is_current_session(generation) {
+                                            return Err("stale session generation".to_string());
+                                        }
+                                        direct_failure = e;
+                                    }
+                                }
+                            } else {
+                                return handshake_after_relay(
+                                    &mut direct_stream,
+                                    peer_id,
+                                    password,
+                                    generation,
+                                    3,
+                                    15,
+                                );
+                            }
+                        }
+                        Err(e) => direct_failure = e,
                     }
                 }
+                let hint = if relay_hint.is_empty() { "" } else { relay_hint };
+                if !direct_failure.is_empty() {
+                    append_log(&format!("direct attempt failed; falling back to relay: {direct_failure}"));
+                }
+                return match request_and_join_relay(
+                    server,
+                    hint,
+                    configured_relay,
+                    peer_id,
+                    licence_key,
+                    password,
+                    generation,
+                ) {
+                    Ok(msg) => Ok(msg),
+                    Err(e2) if route_policy == 2 => Ok(format!(
+                        "RESULT: ONLINE {peer_id} {other} DIRECT_FAIL {} RELAY_FAIL {e2}",
+                        if direct_failure.is_empty() { "not eligible" } else { &direct_failure }
+                    )),
+                    Err(e2) if !direct_failure.is_empty() => Ok(format!(
+                        "RESULT: ONLINE {peer_id} PUNCH_FAIL {} RELAY_FAIL {e2}", direct_failure
+                    )),
+                    Err(e2) => Ok(format!("RESULT: ONLINE {peer_id} {other} RELAY_FAIL {e2}")),
+                };
+            }
+            if route_policy == 1 {
+                // The server normally returns ONLINE_RELAY for a forced request;
+                // if it still returns a direct candidate, policy 1 must not use it.
+                append_log("force-relay policy ignored direct candidate");
             }
             let relay_hint = other.strip_prefix("ONLINE_RELAY ").unwrap_or("");
             match request_and_join_relay(
@@ -2021,6 +2266,7 @@ fn lookup_peer(
                 peer_id,
                 licence_key,
                 password,
+                generation,
             )
             {
                 Ok(msg) => Ok(msg),
@@ -2039,7 +2285,25 @@ pub extern "C" fn hd_init() -> c_int {
     append_log("hdcore init ok");
     HARDWARE_MODIFIER_MASK.store(0, Ordering::SeqCst);
     STATUS.store(STATUS_IDLE, Ordering::SeqCst);
+    ROUTE_KIND.store(0, Ordering::SeqCst);
     0
+}
+
+/// Select route policy: 0 legacy, 1 force relay for ID peers, 2 server-marked LAN auto.
+/// Invalid values return -1 and leave the active policy unchanged.
+#[no_mangle]
+pub extern "C" fn hd_set_route_policy(policy: c_int) -> c_int {
+    if !(0..=2).contains(&policy) {
+        return -1;
+    }
+    ROUTE_POLICY.store(policy, Ordering::SeqCst);
+    0
+}
+
+/// Route of the successful session: 0 pending, 1 LAN direct, 2 relay, 3 legacy/explicit direct.
+#[no_mangle]
+pub extern "C" fn hd_route_kind() -> c_int {
+    ROUTE_KIND.load(Ordering::SeqCst)
 }
 
 #[no_mangle]
@@ -2097,9 +2361,12 @@ pub extern "C" fn hd_connect_start(desk_id: *const c_char, password: *const c_ch
         return -1;
     }
 
-    CONNECT_GEN.fetch_add(1, Ordering::SeqCst);
+    let _session_state = SESSION_STATE.lock().unwrap_or_else(|p| p.into_inner());
     HARDWARE_MODIFIER_MASK.store(0, Ordering::SeqCst);
-    let gen = CONNECT_GEN.load(Ordering::SeqCst);
+    let gen = CONNECT_GEN.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+    let route_policy = ROUTE_POLICY.load(Ordering::SeqCst);
+    let configured_force_relay = FORCE_RELAY.load(Ordering::SeqCst);
+    ROUTE_KIND.store(0, Ordering::SeqCst);
     let direct = is_direct_ip_peer(&desk);
     DIRECT_IP_SESSION.store(direct, Ordering::SeqCst);
     // 默认与直连相同：高清档（custom 100/60）；UI 仍可切流畅
@@ -2160,29 +2427,38 @@ pub extern "C" fn hd_connect_start(desk_id: *const c_char, password: *const c_ch
         .name("hd-lookup".into())
         .spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
-            if CONNECT_GEN.load(Ordering::SeqCst) != gen {
+            let started = with_current_session(gen, || STATUS.store(STATUS_CONNECTING, Ordering::SeqCst));
+            if started.is_none() {
                 return;
             }
-            STATUS.store(STATUS_CONNECTING, Ordering::SeqCst);
-            match lookup_peer(&server, &configured_relay, &desk, &licence, &password) {
+            match lookup_peer(
+                &server,
+                &configured_relay,
+                &desk,
+                &licence,
+                &password,
+                gen,
+                route_policy,
+                configured_force_relay,
+            ) {
                 Ok(msg) => {
-                    if CONNECT_GEN.load(Ordering::SeqCst) != gen {
+                    let updated = with_current_session(gen, || {
+                        append_log(&format!("lookup ok {msg}"));
+                        if !msg.contains("LOGIN_OK") {
+                            set_error("");
+                            STATUS.store(STATUS_READY, Ordering::SeqCst);
+                        }
+                    });
+                    if updated.is_none() || msg.contains("LOGIN_OK") {
                         return;
                     }
-                    append_log(&format!("lookup ok {msg}"));
-                    if msg.contains("LOGIN_OK") {
-                        return;
-                    }
-                    set_error("");
-                    STATUS.store(STATUS_READY, Ordering::SeqCst);
                 }
                 Err(e) => {
-                    if CONNECT_GEN.load(Ordering::SeqCst) != gen {
-                        return;
-                    }
-                    set_error(&e);
-                    append_log(&format!("lookup failed {e}"));
-                    STATUS.store(STATUS_FAILED, Ordering::SeqCst);
+                    let _ = with_current_session(gen, || {
+                        set_error(&e);
+                        append_log(&format!("lookup failed {e}"));
+                        STATUS.store(STATUS_FAILED, Ordering::SeqCst);
+                    });
                 }
             }
         });
@@ -2239,11 +2515,13 @@ pub extern "C" fn hd_copy_check_result(buf: *mut c_char, len: c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn hd_disconnect() {
+    let _session_state = SESSION_STATE.lock().unwrap_or_else(|p| p.into_inner());
     CONNECT_GEN.fetch_add(1, Ordering::SeqCst);
     HARDWARE_MODIFIER_MASK.store(0, Ordering::SeqCst);
     RUNNING.store(false, Ordering::SeqCst);
     DIRECT_IP_SESSION.store(false, Ordering::SeqCst);
     HD_PROFILE.store(false, Ordering::SeqCst);
+    ROUTE_KIND.store(0, Ordering::SeqCst);
     STATUS.store(STATUS_IDLE, Ordering::SeqCst);
     append_log("hdcore disconnect");
 }
@@ -2402,6 +2680,70 @@ pub extern "C" fn hd_copy_packet(buf: *mut u8, len: c_int) -> c_int {
         std::ptr::copy_nonoverlapping(packet.data.as_ptr(), buf, n);
     }
     n as c_int
+}
+
+/// Pop one encoded video packet and return its bytes and metadata together.
+///
+/// Return values: `0` means the queue is empty; a positive value is the exact
+/// packet byte count; a negative value is the required byte count when `buf`
+/// is too small. On an undersized buffer the packet remains queued, so callers
+/// can retry without losing a keyframe or silently decoding a truncated NAL.
+/// `codec_out` is 1 for H.264, 2 for H.265, and 0 for an unknown codec;
+/// `key_out` is 1 for a keyframe and 0 otherwise. Invalid pointers/lengths or
+/// a packet too large to represent as `c_int` return `c_int::MIN` without
+/// removing the packet. An empty queued packet is discarded and also returns
+/// `c_int::MIN`.
+#[no_mangle]
+pub extern "C" fn hd_copy_packet_ex(
+    buf: *mut u8,
+    len: c_int,
+    codec_out: *mut c_int,
+    key_out: *mut c_int,
+) -> c_int {
+    if buf.is_null() || len <= 0 || codec_out.is_null() || key_out.is_null() {
+        return c_int::MIN;
+    }
+
+    let packet = {
+        let mut queue = match PACKET_Q.lock() {
+            Ok(queue) => queue,
+            Err(_) => return c_int::MIN,
+        };
+        let Some(front) = queue.front() else {
+            return 0;
+        };
+        if front.data.is_empty() {
+            queue.pop_front();
+            return c_int::MIN;
+        }
+        let Ok(required) = c_int::try_from(front.data.len()) else {
+            return c_int::MIN;
+        };
+        if required > len {
+            return -required;
+        }
+        let Some(packet) = queue.pop_front() else {
+            return c_int::MIN;
+        };
+        packet
+    };
+
+    let codec = match packet.codec.as_str() {
+        "h264" => 1,
+        "h265" => 2,
+        _ => 0,
+    };
+    let key = if packet.key { 1 } else { 0 };
+    unsafe {
+        std::ptr::copy_nonoverlapping(packet.data.as_ptr(), buf, packet.data.len());
+        *codec_out = codec;
+        *key_out = key;
+    }
+    LAST_COPIED_KEY.store(key, Ordering::SeqCst);
+    if let Ok(mut last_codec) = LAST_CODEC.lock() {
+        *last_codec = packet.codec;
+    }
+    packet.data.len() as c_int
 }
 
 fn copy_stored_packet(slot: &Mutex<Option<EncodedPacket>>, buf: *mut u8, len: c_int) -> c_int {
@@ -2622,7 +2964,10 @@ pub extern "C" fn hd_send_clipboard_text(text: *const c_char) -> c_int {
     }
     let payload = build_clipboard_text(&text);
     if let Ok(mut queue) = OUTGOING.lock() {
-        queue.push(frame_message(&payload));
+        queue.push(OutgoingMessage {
+            generation: CONNECT_GEN.load(Ordering::SeqCst),
+            frame: frame_message(&payload),
+        });
     } else {
         append_log("clipboard text: OUTGOING lock failed");
         return -1;
@@ -2633,6 +2978,87 @@ pub extern "C" fn hd_send_clipboard_text(text: *const c_char) -> c_int {
         text.chars().count()
     ));
     0
+}
+
+#[cfg(test)]
+mod routing_policy_tests {
+    use super::*;
+
+    #[test]
+    fn route_policy_validation_and_force_semantics_are_stable() {
+        let original = ROUTE_POLICY.load(Ordering::SeqCst);
+        assert_eq!(hd_set_route_policy(0), 0);
+        assert!(!effective_force_relay(0, false));
+        assert!(effective_force_relay(0, true));
+        assert_eq!(hd_set_route_policy(1), 0);
+        assert!(effective_force_relay(1, false));
+        assert_eq!(hd_set_route_policy(2), 0);
+        assert!(!effective_force_relay(2, true));
+        assert_eq!(hd_set_route_policy(99), -1);
+        assert_eq!(ROUTE_POLICY.load(Ordering::SeqCst), 2);
+        ROUTE_POLICY.store(original, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn auto_route_requires_server_local_marker_and_private_unicast_ipv4() {
+        let mut punch = Vec::new();
+        encode_varint_field(&mut punch, 6, 1); // PunchHoleResponse.is_local
+        encode_bytes(&mut punch, 4, b"relay.example:21117");
+        let mut response = Vec::new();
+        encode_bytes(&mut response, 11, &punch);
+        let parsed = parse_punch_response_info(&response).expect("PunchHoleResponse parsed");
+        assert!(parsed.is_local);
+        assert_eq!(parsed.detail, "ONLINE_RELAY relay.example:21117");
+        let mut non_local_punch = Vec::new();
+        encode_varint_field(&mut non_local_punch, 6, 1);
+        encode_varint_field(&mut non_local_punch, 5, 1); // later oneof member supersedes is_local
+        let mut non_local_response = Vec::new();
+        encode_bytes(&mut non_local_response, 11, &non_local_punch);
+        assert!(!parse_punch_response_info(&non_local_response).unwrap().is_local);
+
+        assert_eq!(auto_lan_candidate("192.168.1.23:21118").unwrap().to_string(), "192.168.1.23:21118");
+        assert_eq!(auto_lan_candidate("10.4.2.1:21118").unwrap().to_string(), "10.4.2.1:21118");
+        for rejected in [
+            "8.8.8.8:21118",
+            "127.0.0.1:21118",
+            "169.254.1.2:21118",
+            "224.0.0.1:21118",
+            "0.0.0.0:21118",
+            "192.168.1.23:0",
+            "[fd00::1]:21118",
+        ] {
+            assert!(auto_lan_candidate(rejected).is_none(), "accepted {rejected}");
+        }
+    }
+
+    #[test]
+    fn stale_session_writer_cannot_take_new_generation_input() {
+        assert!(session_generation_matches(11, 11));
+        assert!(!session_generation_matches(11, 10));
+
+        let mut queue = vec![
+            OutgoingMessage { generation: 10, frame: vec![1] },
+            OutgoingMessage { generation: 11, frame: vec![2] },
+        ];
+        assert_eq!(take_outgoing_for_generation(&mut queue, 10), vec![vec![1]]);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].generation, 11);
+        assert_eq!(take_outgoing_for_generation(&mut queue, 11), vec![vec![2]]);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn auto_handshake_frame_read_obeys_absolute_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.write_all(&[12, b'x']).unwrap(); // frame says 3 payload bytes; only 1 follows
+        let start = Instant::now();
+        let error = read_framed_until(&mut client, start + Duration::from_millis(100))
+            .expect_err("incomplete frame must hit the deadline");
+        assert!(error.contains("timeout"), "unexpected error: {error}");
+        assert!(start.elapsed() < Duration::from_millis(500), "read exceeded bound");
+    }
 }
 
 // ===== Stage 3A unit tests =====
@@ -2790,7 +3216,7 @@ mod clipboard_tests {
 
         let active = [4 as c_int, 29 as c_int, 63 as c_int]; // Control + Shift + NumLock
         hd_send_hardware_key(1, 'c' as c_int, 1, active.as_ptr(), active.len() as c_int);
-        let key_packet = OUTGOING.lock().unwrap()[0].clone();
+        let key_packet = OUTGOING.lock().unwrap()[0].frame.clone();
         assert_eq!(key_event_fields(&key_packet), (None, Some('c' as u32), true, vec![4, 29, 63]));
         let mouse_packet = build_mouse_event(1, 10, 20);
         assert_eq!(mouse_modifiers(&mouse_packet), vec![4, 29]);
@@ -2802,13 +3228,13 @@ mod clipboard_tests {
         OUTGOING.lock().unwrap().clear();
         // IME navigation callbacks must preserve held Shift for remote selection.
         hd_send_control(22, 1, 1);
-        let controls = OUTGOING.lock().unwrap().clone();
+        let controls = OUTGOING.lock().unwrap().iter().map(|m| m.frame.clone()).collect::<Vec<_>>();
         assert_eq!(key_event_fields(&controls[0]), (Some(22), None, true, vec![29]));
         assert_eq!(key_event_fields(&controls[1]), (Some(22), None, false, vec![29]));
         OUTGOING.lock().unwrap().clear();
         let text = std::ffi::CString::new("x").unwrap();
         hd_send_text(text.as_ptr());
-        let text_packets = OUTGOING.lock().unwrap().clone();
+        let text_packets = OUTGOING.lock().unwrap().iter().map(|m| m.frame.clone()).collect::<Vec<_>>();
         let last_text_key = key_event_fields(text_packets.last().unwrap());
         assert_eq!(last_text_key, (Some(29), None, true, vec![]));
         assert!(text_packets.iter().any(|packet| key_event_fields(packet).1 == Some('x' as u32)));
@@ -2823,7 +3249,7 @@ mod clipboard_tests {
 
         OUTGOING.lock().unwrap().clear();
         hd_send_chord('c' as c_int, 4);
-        let chord_packets = OUTGOING.lock().unwrap().clone();
+        let chord_packets = OUTGOING.lock().unwrap().iter().map(|m| m.frame.clone()).collect::<Vec<_>>();
         let last_chord_key = key_event_fields(chord_packets.last().unwrap());
         assert_eq!(last_chord_key, (Some(29), None, true, vec![]));
         assert!(chord_packets.iter().any(|packet| key_event_fields(packet).1 == Some('c' as u32)));
@@ -3233,5 +3659,63 @@ mod clipboard_tests {
             "compressed text must round-trip exactly through multi-clipboards"
         );
         assert_eq!(CLIPBOARD_SEQ.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod video_packet_ffi_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[test]
+    fn packet_copy_ex_keeps_undersized_packet_and_returns_matching_metadata() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let packet_bytes = [0, 0, 0, 1, 0x26, 0x01];
+        {
+            let mut queue = PACKET_Q.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue.clear();
+            queue.push_back(EncodedPacket {
+                codec: "h265".to_string(),
+                data: packet_bytes.to_vec(),
+                key: true,
+            });
+        }
+        LAST_COPIED_KEY.store(0, Ordering::SeqCst);
+        *LAST_CODEC.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = "stale".to_string();
+
+        let mut too_small = [0u8; 4];
+        let mut codec = -7;
+        let mut key = -7;
+        assert_eq!(
+            hd_copy_packet_ex(
+                too_small.as_mut_ptr(),
+                too_small.len() as c_int,
+                &mut codec,
+                &mut key,
+            ),
+            -(packet_bytes.len() as c_int)
+        );
+        assert_eq!(hd_queue_len(), 1, "an undersized copy must keep the packet queued");
+        assert_eq!((codec, key), (-7, -7), "undersized copy must not publish metadata");
+        assert_eq!(hd_packet_key(), 0);
+        assert_eq!(*LAST_CODEC.lock().unwrap_or_else(|poisoned| poisoned.into_inner()), "stale");
+
+        let mut exact = [0u8; 6];
+        assert_eq!(
+            hd_copy_packet_ex(
+                exact.as_mut_ptr(),
+                exact.len() as c_int,
+                &mut codec,
+                &mut key,
+            ),
+            packet_bytes.len() as c_int
+        );
+        assert_eq!(exact, packet_bytes);
+        assert_eq!((codec, key), (2, 1));
+        assert_eq!(hd_packet_key(), 1);
+        assert_eq!(*LAST_CODEC.lock().unwrap_or_else(|poisoned| poisoned.into_inner()), "h265");
+        assert_eq!(hd_queue_len(), 0);
     }
 }

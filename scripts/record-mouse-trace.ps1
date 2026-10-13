@@ -1,7 +1,19 @@
-$ErrorActionPreference = "Continue"
-$hdc = "C:\Users\Administrator\Projects\ohos-sdk\toolchains\hdc.exe"
-$serial = "6XE0225B25017248"
-$out = "C:\Users\Administrator\Projects\HarmonyDesk\mouse_trace.log"
+param(
+  [string]$HdcPath = $env:HDC_PATH,
+  [string]$DeviceId = $env:HDC_DEVICE_ID
+)
+$ErrorActionPreference = "Stop"
+if (-not $HdcPath) {
+  $command = Get-Command hdc -ErrorAction SilentlyContinue
+  if (-not $command) { throw 'Set HDC_PATH or add hdc to PATH.' }
+  $HdcPath = $command.Source
+}
+if (-not $DeviceId -or $DeviceId -notmatch '^[A-Za-z0-9_.:-]+$') {
+  throw 'Set HDC_DEVICE_ID or pass -DeviceId with the target device identifier.'
+}
+$hdc = $HdcPath
+$serial = $DeviceId
+$out = Join-Path (Split-Path -Parent $PSScriptRoot) 'mouse_trace.log'
 
 if (Test-Path $out) {
   Remove-Item $out -Force
